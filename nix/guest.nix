@@ -43,6 +43,14 @@ let
   # absolute path the directory has on the host.
   readMount = ''IFS= read -r -d "" tag && IFS= read -r -d "" path && IFS= read -r -d "" mode'';
 
+  # The launch input "forward-path" lists the bin directories of the
+  # packages the host built for the launch as NUL-terminated store paths,
+  # which the guest sees through the ro-store share. This puts them in front
+  # of PATH in that order; an empty list leaves PATH unchanged.
+  prependForwardPath = ''
+    PATH="$(${lib.getExe' pkgs.coreutils "tr"} '\0' : < /mnt/launch/forward-path)$PATH"
+  '';
+
   # Emits the per-launch QEMU arguments: the VM size from CLAUDEVM_VCPU and
   # CLAUDEVM_MEM (MiB) and a vhost-user-fs device per extra mount. QEMU
   # applies the last -smp and -m it is given, so these override the baked
@@ -90,6 +98,7 @@ let
       # shellcheck disable=SC1091
       . /mnt/launch/env
       set +a
+      ${prependForwardPath}
       if [ -n "''${ROWS:-}" ] && [ -n "''${COLS:-}" ]; then
         stty rows "$ROWS" cols "$COLS" || true
       fi
@@ -222,6 +231,10 @@ in
 
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
+    # Login shells such as the debug shell reset PATH in
+    # /etc/set-environment, which runs this last.
+    environment.extraInit = lib.mkAfter prependForwardPath;
+
     # virtiofsd translates this uid and the gid of the users group (100) to
     # the invoking host user's ids, so the host ids are free to differ.
     users.users.agent = {
@@ -246,7 +259,7 @@ in
     ];
 
     systemd.services.claudevm-home = {
-      description = "Prepare agent home and extra mounts from the launch share";
+      description = "Prepare agent home, managed settings and extra mounts from the launch share";
       unitConfig.RequiresMountsFor = [ "/mnt/launch" ];
       onFailure = [ "poweroff.target" ];
       path = [ pkgs.util-linux ];
@@ -264,6 +277,10 @@ in
           ${agent.home}/.claude
         if [ -e /mnt/launch/claude.json ]; then
           install -o ${agent.name} -g ${agent.group} -m 0600 /mnt/launch/claude.json ${agent.home}/.claude.json
+        fi
+        if [ -e /mnt/launch/managed-settings.json ]; then
+          install -d -o root -g root -m 0755 /etc/claude-code
+          install -o root -g root -m 0444 /mnt/launch/managed-settings.json /etc/claude-code/managed-settings.json
         fi
         # The host enforces ro with virtiofsd --readonly; the ro mount
         # option makes the guest report it up front.

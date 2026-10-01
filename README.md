@@ -29,9 +29,9 @@ also powers it off. SIGINT, SIGHUP or SIGTERM stops QEMU and virtiofsd.
 - `claudevm` without a subcommand or with an unknown one prints usage.
 - The terminal size is applied once at launch; resizes do not reach the
   serial console. Host environment variables other than `TERM` stay out.
-- The exit status is QEMU's, not Claude Code's; 1 if a launch check fails or
-  virtiofsd dies mid-session; 2 on a usage error; 129/130/143 on
-  SIGHUP/SIGINT/SIGTERM.
+- The exit status is QEMU's, not Claude Code's; 1 if a launch check or a
+  `forward_packages` build fails or virtiofsd dies mid-session; 2 on a usage
+  error; 129/130/143 on SIGHUP/SIGINT/SIGTERM.
 
 ## Configuration
 
@@ -43,15 +43,17 @@ session apply from the next launch. Every key is optional:
 ```toml
 vcpu = 4          # default 4, clamped to 1..host CPUs
 memory = 4096     # MiB, default 4096, clamped to 512..host MemTotal
+forward_packages = ["nixpkgs#ripgrep", ".#mytool", "~/code/tool#cli"]
 
 [[mounts]]        # one table per extra host directory
 path = "~/data"   # absolute, or starting with ~/
 writable = false  # default false: read-only
 ```
 
-- Unknown keys, wrong types and values that are not positive integers are
-  errors, reported before anything starts. `graphics` and `resolution` are
-  reserved and rejected as not implemented yet.
+- Unknown keys, wrong types, values that are not positive integers and empty
+  `forward_packages` entries are errors, reported before anything starts.
+  `graphics` and `resolution` are reserved and rejected as not implemented
+  yet.
 - A clamped value is shown as `(clamped from N)`. `memory = 2048` launches
   with 2047 MiB, because QEMU's microvm machine hangs at boot with exactly
   2 GiB.
@@ -62,10 +64,25 @@ writable = false  # default false: read-only
   is or contains `$HOME` (directories under it are fine), overlaps
   `~/.claude`, `~/.claude.json`, the workspace, `/nix`, a guest path the VM
   uses (`/workspace`, `/mnt/launch`, `/home/agent`) or another mount.
+- `forward_packages` puts programs on the agent's PATH. Each entry is a nix
+  flake installable, passed as written to `nix build` on the host except
+  that a leading `~/` is expanded, so `ripgrep` alone fails where
+  `nixpkgs#ripgrep` works. Relative references such as `.#mytool` resolve
+  against the workspace.
+- The builds run at launch, before the VM starts, with your nix settings
+  and under nix's normal build sandbox. The first build of an entry may
+  need network access and take a while; later launches reuse what is already
+  in the host store. A failed build aborts the launch with nix's error.
+- Every `bin` directory among the outputs `nix build` produces for an entry
+  goes on the agent's PATH, ahead of the rest of PATH and in the order
+  listed; an entry without one is an error. The VM reads them through its
+  share of the host nix store and downloads nothing. The built paths are
+  kept from garbage collection until the session ends.
 - `claudevm.toml` lives in the workspace, so it is visible and editable
   inside the VM by design. Every launch prints the effective configuration
-  before the VM starts: the workspace, each mount with `ro` or `rw`, vcpu and
-  memory.
+  after the `forward_packages` builds and before the VM starts: the
+  workspace, each mount with `ro` or `rw`, each `forward_packages` entry,
+  vcpu and memory.
 
 ## What the VM can and cannot do
 
@@ -77,6 +94,7 @@ $PWD            rw   --->   /workspace
 ~/.claude       copy --->   ~agent/.claude       allowlisted entries; guest
                                                  writes are discarded
 ~/.claude.json  copy --->   ~agent/.claude.json  without its projects map
+managed settings copy -->   same path            /etc/claude-code, if present
 /nix/store      ro   --->   /nix/.ro-store       plus a writable overlay
 host loopback   blocked
 internet, LAN   outbound only, nothing inbound
@@ -90,10 +108,13 @@ everything else not shared
 - Claude config: each launch copies `settings.json`, `CLAUDE.md`,
   `keybindings.json`, `.credentials.json`, `agents`, `commands`, `skills`,
   `plugins`, `hooks` and `output-styles` into a read-only share, mounted
-  under a tmpfs-backed overlay. Transcripts, prompt history, todos and other
-  per-project data never enter the VM and the VM's own are discarded, so
-  `claude --resume` does not work across runs. OAuth refreshes inside the VM
-  are discarded too; after long sessions the host may need to log in again.
+  under a tmpfs-backed overlay. The host's
+  `/etc/claude-code/managed-settings.json`, when present and readable, is
+  forwarded read-only to the same path in the VM. Transcripts, prompt
+  history, todos and other per-project data never enter the VM and the VM's
+  own are discarded, so `claude --resume` does not work across runs. OAuth
+  refreshes inside the VM are discarded too; after long sessions the host
+  may need to log in again.
 - Network: QEMU user-mode networking with DHCP and QEMU's DNS resolver. The
   guest firewall rejects 10.0.2.2 and fec0::2, through which QEMU would
   reach the host's loopback services.
@@ -110,6 +131,9 @@ everything else not shared
 - Workspace content can steer tools you later run there on the host, such as
   git hooks and config or build scripts. Treat it after a session as you
   would a freshly cloned repository.
+- A launch with `forward_packages` builds whatever the named flakes define,
+  including a workspace flake the agent may have edited: the same trust as
+  running `nix build` in that repository yourself.
 - Outbound network is open, so anything readable inside the VM, including
   the entire host nix store, can in principle be sent out. LAN hosts and
   host services listening on non-loopback addresses are reachable.
@@ -128,8 +152,9 @@ everything else not shared
 
 ## Tuning
 
-VM size and extra mounts are set per project in `claudevm.toml` and take
-effect at the next launch without a rebuild. `claudevm.vcpu` and
-`claudevm.memory` in `nix/guest.nix` are the defaults that `claudevm init`
-writes and that apply to a key the file leaves out. Claude Code comes from
+VM size, extra mounts and forwarded packages are set per project in
+`claudevm.toml` and take effect at the next launch without rebuilding
+`claudevm`. `claudevm.vcpu` and `claudevm.memory` in `nix/guest.nix` are the
+defaults that `claudevm init` writes and that apply to a key the file leaves
+out. Claude Code comes from
 the nixpkgs in `flake.lock`.
