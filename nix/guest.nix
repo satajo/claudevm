@@ -98,6 +98,9 @@ let
       # shellcheck disable=SC1091
       . /mnt/launch/env
       set +a
+      # Claude Code trusts its working directory and skips the trust dialog
+      # when this says it runs in a sandbox.
+      export CLAUDE_CODE_SANDBOXED=1
       ${prependForwardPath}
       if [ -n "''${ROWS:-}" ] && [ -n "''${COLS:-}" ]; then
         stty rows "$ROWS" cols "$COLS" || true
@@ -146,6 +149,23 @@ in
     microvm = {
       hypervisor = "qemu";
       mem = 512;
+      qemu = {
+        # The runner's own serial console adds earlyprintk=ttyS0 to the
+        # kernel command line, which makes the boot loader and the kernel
+        # report their progress on the console the session appears on.
+        # Serving the same chardev here leaves the command line to
+        # boot.kernelParams.
+        serialConsole = false;
+        extraArgs = [
+          # qboot, unlike the SeaBIOS that QEMU loads by default, prints no
+          # version banner and resets no terminal, so the launch output
+          # stays on screen.
+          "-bios"
+          "${config.microvm.qemu.package}/share/qemu/qboot.rom"
+          "-serial"
+          "chardev:stdio"
+        ];
+      };
       extraArgsScript = lib.getExe launchArgs;
       inherit shares;
       writableStoreOverlay = "/nix/.rw-store";
@@ -204,7 +224,14 @@ in
         wait -n
       '';
 
-    boot.kernelParams = [ "quiet" ];
+    # quiet also silences systemd's unit status lines. Log level 3 keeps
+    # kernel messages less severe than critical off the console, among them
+    # the harmless "PCI: Fatal: No config space access function found" of the
+    # microvm machine; the journal still has them all. Mount failures and the
+    # emergency shutdown come from systemd, which writes to the console
+    # itself.
+    boot.kernelParams = [ "console=ttyS0" "quiet" ];
+    boot.consoleLogLevel = 3;
 
     networking.useNetworkd = true;
     systemd.network.wait-online = {
@@ -282,6 +309,10 @@ in
           install -d -o root -g root -m 0755 /etc/claude-code
           install -o root -g root -m 0444 /mnt/launch/managed-settings.json /etc/claude-code/managed-settings.json
         fi
+        # Claude Code refuses to run when /tmp/claude-<uid>, the directory it
+        # keeps its temporary files in, belongs to another user. An extra
+        # mount whose path lies under it would leave it owned by root.
+        install -d -o ${agent.name} -g ${agent.group} -m 0700 /tmp/claude-${toString agent.uid}
         # The host enforces ro with virtiofsd --readonly; the ro mount
         # option makes the guest report it up front.
         while ${readMount}; do

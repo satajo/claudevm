@@ -11,22 +11,27 @@ ends the VM powers off and all its state outside those directories is gone.
 
 ```
 cd ~/projects/some-repo
-nix run /path/to/claudevm -- init                          # write ./claudevm.toml
-nix run /path/to/claudevm -- launch                        # start Claude Code
-nix run /path/to/claudevm -- launch "summarize this repo"  # arguments go to claude
+nix run /path/to/claudevm -- init                   # write ./claudevm.toml
+nix run /path/to/claudevm                           # start Claude Code
+nix run /path/to/claudevm -- "summarize this repo"  # arguments go to claude
 ```
 
 To install `claudevm`, use `nix profile install /path/to/claudevm`, or add
 the flake as an input and its `packages.x86_64-linux.default` to your
-packages. The commands are then `claudevm init`, `claudevm launch` and
+packages. The commands are then `claudevm`, `claudevm init` and
 `claudevm shell`.
+
+`claudevm` takes what `claude` takes: every argument other than the `init`
+and `shell` subcommands goes to the Claude Code running in the VM.
 
 Boot waits for the guest network and takes about ten seconds. When Claude
 Code exits, the VM powers off and `claudevm` cleans up; a failed guest mount
 also powers it off. SIGINT, SIGHUP or SIGTERM stops QEMU and virtiofsd.
 
-- `claudevm shell` gives a debug shell instead of Claude Code.
-- `claudevm` without a subcommand or with an unknown one prints usage.
+- `claudevm shell` gives a debug shell instead of Claude Code, and takes no
+  arguments.
+- The guest boots quietly: kernel and firmware messages stay off the console
+  so that the launch output above them remains readable.
 - The terminal size is applied once at launch; resizes do not reach the
   serial console. Host environment variables other than `TERM` stay out.
 - The exit status is QEMU's, not Claude Code's; 1 if a launch check or a
@@ -35,7 +40,7 @@ also powers it off. SIGINT, SIGHUP or SIGTERM stops QEMU and virtiofsd.
 
 ## Configuration
 
-`launch` and `shell` require a `claudevm.toml` in the working directory.
+Every start of the VM requires a `claudevm.toml` in the working directory.
 `claudevm init` writes one with the defaults and refuses to overwrite an
 existing file. `claudevm` reads it once at launch, so edits made during a
 session apply from the next launch. Every key is optional:
@@ -115,6 +120,12 @@ everything else not shared
   own are discarded, so `claude --resume` does not work across runs. OAuth
   refreshes inside the VM are discarded too; after long sessions the host
   may need to log in again.
+- Startup prompts: the session starts without the trust prompt and the
+  bypass permissions prompt. The guest tells Claude Code that it runs in a
+  sandbox, which makes it trust its working directory, and the staged
+  `settings.json` carries the accepted bypass permissions disclaimer, which
+  Claude Code would otherwise ask about once per installation and forget
+  again with the VM.
 - Network: QEMU user-mode networking with DHCP and QEMU's DNS resolver. The
   guest firewall rejects 10.0.2.2 and fec0::2, through which QEMU would
   reach the host's loopback services.

@@ -76,25 +76,16 @@ writeShellApplication {
   text = ''
     usage() {
       cat >&2 <<'EOF'
-    usage: claudevm launch [claude-args...]  run Claude Code on this directory in a VM
-           claudevm shell                    run a debug shell instead of Claude Code
-           claudevm init                     write a default claudevm.toml here
+    usage: claudevm [claude-args...]  run Claude Code on this directory in a VM
+           claudevm init             write a default claudevm.toml here
+           claudevm shell            run a debug shell in the VM
     EOF
     }
 
+    # Everything that is not one of the two subcommands is an argument of the
+    # Claude Code the VM runs, so that claudevm takes what claude takes.
+    session=claude
     case ''${1-} in
-      launch)
-        session=claude
-        shift
-        ;;
-      shell)
-        session=shell
-        shift
-        if [ "$#" -ne 0 ]; then
-          usage
-          exit 2
-        fi
-        ;;
       init)
         if [ "$#" -ne 1 ]; then
           usage
@@ -108,13 +99,13 @@ writeShellApplication {
         echo "claudevm: created claudevm.toml" >&2
         exit 0
         ;;
-      -h | --help)
-        usage
-        exit 0
-        ;;
-      *)
-        usage
-        exit 2
+      shell)
+        session=shell
+        shift
+        if [ "$#" -ne 0 ]; then
+          usage
+          exit 2
+        fi
         ;;
     esac
 
@@ -387,6 +378,18 @@ writeShellApplication {
     done
     # Copies of read-only sources such as store paths must stay removable.
     chmod -R u+w "$runtime/launch/claude"
+    # Claude Code asks once per installation to accept bypass permissions
+    # mode and records the answer in the settings it writes. The VM discards
+    # its writes, so the staged settings carry the answer into every session.
+    staged_settings=$runtime/launch/claude/settings.json
+    if [ ! -e "$staged_settings" ]; then
+      echo '{}' > "$staged_settings"
+    fi
+    if ! jq '.skipDangerousModePermissionPrompt = true' "$staged_settings" > "$staged_settings.staged"; then
+      echo "claudevm: $HOME/.claude/settings.json is not valid JSON" >&2
+      exit 1
+    fi
+    mv "$staged_settings.staged" "$staged_settings"
     if [ -e "$HOME/.claude.json" ]; then
       jq 'del(.projects)' "$HOME/.claude.json" > "$runtime/launch/claude.json"
     fi
