@@ -86,10 +86,29 @@ let
     '';
   };
 
+  # The Claude Code config of the image, which every session starts from
+  # and nothing from the host adds to. Claude Code asks once per
+  # installation to accept bypass permissions mode and records the answer
+  # in settings.json; syncClaudeAiPlugins = false keeps the plugins enabled
+  # on the claude.ai account out of the VM.
+  claudeSettings = pkgs.writeText "claude-settings.json" (builtins.toJSON {
+    skipDangerousModePermissionPrompt = true;
+    syncClaudeAiPlugins = false;
+  });
+  # claudevm-home adds the guest key of the launch to the approved custom
+  # API keys. Claude Code looks an approved key up by its last 20
+  # characters; the full key is approved as well so that either lookup
+  # matches.
+  claudeState = pkgs.writeText "claude.json" (builtins.toJSON {
+    hasCompletedOnboarding = true;
+    theme = "dark";
+    customApiKeyResponses.rejected = [ ];
+  });
+
   claudeSession = pkgs.writeShellApplication {
     name = "claude-session";
     runtimeInputs = [
-      pkgs.claude-code
+      cfg.claudeCode
       pkgs.coreutils
       pkgs.bashInteractive
     ];
@@ -101,13 +120,27 @@ let
       # Claude Code trusts its working directory and skips the trust dialog
       # when this says it runs in a sandbox.
       export CLAUDE_CODE_SANDBOXED=1
+      # The guest key is all the guest holds. The broker on the host
+      # loopback, which QEMU forwards 10.0.2.2 to, swaps it for the token.
+      export ANTHROPIC_API_KEY=$CLAUDEVM_GUEST_KEY
+      export ANTHROPIC_BASE_URL=http://10.0.2.2:$CLAUDEVM_BROKER_PORT
+      export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+      export DISABLE_AUTOUPDATER=1
+      export CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1
       ${prependForwardPath}
       if [ -n "''${ROWS:-}" ] && [ -n "''${COLS:-}" ]; then
         stty rows "$ROWS" cols "$COLS" || true
       fi
       mapfile -d "" -t args < /mnt/launch/claude-args
+      # The launch input "plugin-dirs" lists the guest paths of the plugin
+      # directories of the launch as NUL-terminated paths.
+      mapfile -d "" -t plugin_dirs < /mnt/launch/plugin-dirs
+      plugin_args=()
+      for dir in "''${plugin_dirs[@]}"; do
+        plugin_args+=(--plugin-dir "$dir")
+      done
       case $CLAUDEVM_SESSION in
-        claude) exec claude --dangerously-skip-permissions "''${args[@]}" ;;
+        claude) exec claude --dangerously-skip-permissions "''${plugin_args[@]}" "''${args[@]}" ;;
         shell) exec bash -l ;;
       esac
       echo "claude-session: unknown CLAUDEVM_SESSION '$CLAUDEVM_SESSION'" >&2
@@ -124,6 +157,12 @@ in
     memory = lib.mkOption {
       type = lib.types.ints.positive;
       description = "Guest RAM in MiB of a launch whose claudevm.toml sets no memory.";
+    };
+    claudeCode = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.claude-code;
+      defaultText = lib.literalExpression "pkgs.claude-code";
+      description = "Claude Code package of the guest, also used by claudevm login on the host.";
     };
   };
 
@@ -240,7 +279,8 @@ in
     };
 
     # slirp forwards guest traffic for 10.0.2.2 and fec0::2 to the host's
-    # loopback interface. DHCP to the slirp server at 10.0.2.2 stays open.
+    # loopback interface. DHCP to the slirp server at 10.0.2.2 stays open,
+    # and claudevm-home admits the broker port of the launch at boot.
     networking.nftables = {
       enable = true;
       tables.host-loopback = {
@@ -271,7 +311,7 @@ in
     };
 
     environment.systemPackages = [
-      pkgs.claude-code
+      cfg.claudeCode
       pkgs.git
     ];
 
@@ -286,10 +326,12 @@ in
     ];
 
     systemd.services.claudevm-home = {
-      description = "Prepare agent home, managed settings and extra mounts from the launch share";
+      description = "Prepare agent home, broker access and extra mounts from the launch share";
+      requires = [ "nftables.service" ];
+      after = [ "nftables.service" ];
       unitConfig.RequiresMountsFor = [ "/mnt/launch" ];
       onFailure = [ "poweroff.target" ];
-      path = [ pkgs.util-linux ];
+      path = [ pkgs.util-linux pkgs.nftables pkgs.jq ];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
@@ -297,18 +339,17 @@ in
         StandardError = "journal+console";
       };
       script = ''
-        install -d -o ${agent.name} -g ${agent.group} -m 0700 /run/claudevm/upper
-        mkdir -p /run/claudevm/work ${agent.home}/.claude
-        mount -t overlay overlay \
-          -o lowerdir=/mnt/launch/claude,upperdir=/run/claudevm/upper,workdir=/run/claudevm/work \
-          ${agent.home}/.claude
-        if [ -e /mnt/launch/claude.json ]; then
-          install -o ${agent.name} -g ${agent.group} -m 0600 /mnt/launch/claude.json ${agent.home}/.claude.json
-        fi
-        if [ -e /mnt/launch/managed-settings.json ]; then
-          install -d -o root -g root -m 0755 /etc/claude-code
-          install -o root -g root -m 0444 /mnt/launch/managed-settings.json /etc/claude-code/managed-settings.json
-        fi
+        . /mnt/launch/env
+        : "''${CLAUDEVM_BROKER_PORT:?is not set in /mnt/launch/env}"
+        : "''${CLAUDEVM_GUEST_KEY:?is not set in /mnt/launch/env}"
+        nft insert rule inet host-loopback output \
+          ip daddr 10.0.2.2 tcp dport "$CLAUDEVM_BROKER_PORT" accept
+        install -d -o ${agent.name} -g ${agent.group} -m 0700 ${agent.home}/.claude
+        install -o ${agent.name} -g ${agent.group} -m 0600 ${claudeSettings} ${agent.home}/.claude/settings.json
+        install -o ${agent.name} -g ${agent.group} -m 0600 /dev/null ${agent.home}/.claude.json
+        jq --arg key "$CLAUDEVM_GUEST_KEY" \
+          '.customApiKeyResponses.approved = [$key, $key[-20:]]' \
+          ${claudeState} > ${agent.home}/.claude.json
         # Claude Code refuses to run when /tmp/claude-<uid>, the directory it
         # keeps its temporary files in, belongs to another user. An extra
         # mount whose path lies under it would leave it owned by root.

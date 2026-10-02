@@ -24,14 +24,19 @@
       };
 
       packages.${system} = {
+        broker = pkgs.callPackage ./nix/broker.nix { };
         claudevm = pkgs.callPackage ./nix/claudevm.nix {
           guest = self.nixosConfigurations.claudevm.config;
+          broker = self.packages.${system}.broker;
         };
         default = self.packages.${system}.claudevm;
       };
 
       checks.${system} = {
-        inherit (self.packages.${system}) claudevm;
+        inherit (self.packages.${system}) claudevm broker;
+        broker-test = pkgs.callPackage ./nix/broker-test.nix {
+          broker = self.packages.${system}.broker;
+        };
       };
     };
 }
