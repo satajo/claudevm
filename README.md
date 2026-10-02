@@ -40,9 +40,8 @@ broker.
 - The terminal size is applied once at launch; resizes do not reach the
   serial console. Host environment variables other than `TERM` stay out.
 - The exit status is QEMU's, not Claude Code's; 1 if a launch check fails, a
-  `forward_packages` or `plugins` build fails, or virtiofsd or the broker
-  dies mid-session; 2 on a usage error; 129/130/143 on
-  SIGHUP/SIGINT/SIGTERM.
+  `forward_packages` build fails, or virtiofsd or the broker dies
+  mid-session; 2 on a usage error; 129/130/143 on SIGHUP/SIGINT/SIGTERM.
 
 ### Token
 
@@ -79,7 +78,7 @@ session apply from the next launch. Every key is optional:
 vcpu = 4          # default 4, clamped to 1..host CPUs
 memory = 4096     # MiB, default 4096, clamped to 512..host MemTotal
 forward_packages = ["nixpkgs#ripgrep", ".#mytool", "~/code/tool#cli"]
-plugins = ["./plugins/mine", "~/code/some-plugin", ".#my-plugin"]
+plugin_mounts = ["~/code/some-plugin", "/opt/claude-plugins/review"]
 
 [[mounts]]        # one table per extra host directory
 path = "~/data"   # absolute, or starting with ~/
@@ -87,7 +86,7 @@ writable = false  # default false: read-only
 ```
 
 - Unknown keys, wrong types, values that are not positive integers and empty
-  `forward_packages` or `plugins` entries are errors, reported before
+  `forward_packages` or `plugin_mounts` entries are errors, reported before
   anything starts. `graphics` and `resolution` are reserved and rejected as
   not implemented yet.
 - A clamped value is shown as `(clamped from N)`. `memory = 2048` launches
@@ -98,10 +97,11 @@ writable = false  # default false: read-only
   writable mount are owned by you on the host.
 - `claudevm` refuses a mount path that does not exist, is not a directory,
   is or contains `$HOME` (directories under it are fine), contains
-  `~/.claude`, `~/.claude.json`, the token file or its directory,
-  lies inside `~/.claude`, or overlaps the workspace, `/nix`, a guest path
-  the VM uses (`/workspace`, `/mnt/launch`, `/home/agent`), another mount or
-  a shared plugin directory.
+  `~/.claude`, `~/.claude.json`, the token file or its directory, lies
+  inside `~/.claude`, contains a directory the guest system needs, such as
+  `/etc`, `/tmp` or `/var` (directories under them are fine), or overlaps
+  the workspace, `/nix`, a guest path the VM uses (`/mnt/launch`,
+  `/home/agent`) or another mount.
 - `forward_packages` puts programs on the agent's PATH. Each entry is a nix
   flake installable, passed as written to `nix build` on the host except
   that a leading `~/` is expanded, so `ripgrep` alone fails where
@@ -116,69 +116,75 @@ writable = false  # default false: read-only
   listed; an entry without one is an error. The VM reads them through its
   share of the host nix store and downloads nothing. The built paths are
   kept from garbage collection until the session ends.
-- `plugins` loads Claude Code plugins into the session, in the order listed,
-  each with `--plugin-dir`. Every entry names a plugin directory, which must
-  contain `.claude-plugin/plugin.json`; the launch fails on one that does
-  not.
-- An entry that starts with `/`, `~/` or `./` is a directory on the host:
-  absolute, under your home, or relative to the workspace. Symlinks in the
-  path are resolved. A directory inside the workspace is loaded from its
-  place under `/workspace` and nothing more is shared. Any other directory
-  is shared read-only at its host path, with the same refusals as a mount.
-- Any other entry is a flake installable, built at launch like a
-  `forward_packages` entry and kept until the session ends. The build must
-  produce exactly one output, which is the plugin directory; the VM reads it
-  from the host nix store. A flake at an absolute path therefore needs a
-  `path:` or `git+file:` reference.
+- `plugin_mounts` lists host plugin directories for the session's Claude
+  Code. Each entry is a path written like a mount path, absolute or starting
+  with `~/`, and names a directory that contains
+  `.claude-plugin/plugin.json`; the launch fails on one that does not. The
+  directory is shared read-only at its host path, with symlinks resolved and
+  the same refusals as a mount, and Claude Code loads the plugins in the
+  order listed, each with `--plugin-dir`. A directory inside the workspace
+  or a mount is already visible at its path, so it gets no share of its own
+  and keeps that share's mode; entries must not overlap one another.
 - The plugins reach the Claude Code that the session starts. `claude` run by
   hand in `claudevm shell` loads them only when given `--plugin-dir` itself.
+- A plugin shipped inside the repository needs no mount: Claude Code loads a
+  plugin placed at `.claude/skills/<name>/` with its own
+  `.claude-plugin/plugin.json`. It does so only in a trusted workspace, and
+  the image's defaults trust the workspace.
 - `claudevm.toml` lives in the workspace, so it is visible and editable
   inside the VM by design. Every launch prints the effective configuration
   after the builds and before the VM starts: the workspace, each mount with
-  `ro` or `rw`, each plugin (with `ro` and its host path when it is shared,
-  otherwise its path in the guest), each `forward_packages` entry, vcpu,
+  `ro` or `rw`, one `plugin` line per `plugin_mounts` entry, with `ro` when
+  the entry has a share of its own, each `forward_packages` entry, vcpu,
   memory, and the broker's port and token file.
 
 ## What the VM can and cannot do
 
 ```
-Host                         Guest
-----                         -----
-$PWD             rw   --->   /workspace
-[[mounts]] dirs  ro   --->   same path             rw with writable = true
-plugin dirs      ro   --->   same path             unless in the workspace
-/nix/store       ro   --->   /nix/.ro-store        plus a writable overlay
-token            brokered    the guest holds a per-session dummy key
-~/.claude        not shared
-~/.claude.json   not shared
-host loopback    blocked except the broker's port
-internet, LAN    outbound only, nothing inbound
-everything else  not shared
+Host                            Guest
+----                            -----
+$PWD                rw   --->   same path
+[[mounts]] dirs     ro   --->   same path             rw with writable = true
+plugin_mounts dirs  ro   --->   same path
+/nix/store          ro   --->   /nix/.ro-store        plus a writable overlay
+token               brokered    the guest holds a per-session dummy key
+~/.claude           not shared
+~/.claude.json      not shared
+host loopback       blocked except the broker's port
+internet, LAN       outbound only, nothing inbound
+everything else     not shared
 ```
 
+- Paths: every shared directory, the workspace included, appears in the
+  guest where it is on the host, at its path with symlinks resolved, so
+  absolute paths and symlinks between shared directories keep their meaning
+  in the VM. The session starts in the workspace.
 - Workspace: shared read-write over virtiofs, live in both directions. Files
   the agent creates are owned by you on the host. `claudevm` refuses a
   workspace whose path, after resolving symlinks, is or contains `$HOME`,
-  `~/.claude`, `~/.claude.json`, the token file or its directory, or
-  lies inside `~/.claude`.
+  `~/.claude`, `~/.claude.json`, the token file or its directory, lies
+  inside `~/.claude`, contains a directory the guest system needs, such as
+  `/etc`, `/tmp` or `/var`, or overlaps `/nix` or a guest path the VM uses
+  (`/mnt/launch`, `/home/agent`).
 - Claude config: Claude Code starts from the image's defaults, which mark
-  onboarding as completed and the bypass permissions prompt as accepted,
-  select the dark theme, turn off syncing of the plugins enabled on your
-  claude.ai account, and turn off nonessential traffic and auto-updates.
-  Nothing comes from the host's `~/.claude` or `~/.claude.json`. Project
-  config comes from the workspace, where Claude Code reads `CLAUDE.md`,
-  `.claude/` and `.mcp.json` as it does on the host. Transcripts, prompt
-  history and the rest of the VM's own Claude state are discarded with the
-  VM, so `claude --resume` does not work across runs.
+  onboarding as completed, the bypass permissions prompt as accepted and the
+  workspace as trusted, select the dark theme, turn off syncing of the
+  plugins enabled on your claude.ai account, and turn off nonessential
+  traffic and auto-updates. Nothing comes from the host's `~/.claude` or
+  `~/.claude.json`. Project config comes from the workspace, where Claude
+  Code reads `CLAUDE.md`, `.claude/` and `.mcp.json` as it does on the host
+  in a trusted folder. Transcripts, prompt history and the rest of the VM's
+  own Claude state are discarded with the VM, so `claude --resume` does not
+  work across runs.
 - Token: the guest holds only the session's dummy key. Its Claude Code sends
   API requests to the broker on the host loopback, which QEMU's user-mode
   networking exposes at 10.0.2.2. The broker swaps the key for the token and
   passes the requests on; the token itself never enters the VM.
 - Startup prompts: the session starts without the onboarding, the trust
   prompt, the bypass permissions prompt and the API key approval prompt. The
-  guest tells Claude Code that it runs in a sandbox, which makes it trust
-  its working directory, and the image's defaults carry the other answers,
-  including the approval of the session's key.
+  guest tells Claude Code that it runs in a sandbox, which keeps the trust
+  prompt away, and the image's defaults carry the answers, including the
+  trust of the workspace and the approval of the session's key.
 - Network: QEMU user-mode networking with DHCP and QEMU's DNS resolver. The
   guest firewall rejects 10.0.2.2 and fec0::2, through which QEMU would
   reach the host's loopback services, except the broker's TCP port on
@@ -196,16 +202,17 @@ everything else  not shared
 - Workspace content can steer tools you later run there on the host, such as
   git hooks and config or build scripts. Treat it after a session as you
   would a freshly cloned repository.
-- A launch with `forward_packages` or installable `plugins` builds whatever
-  the named flakes define, including a workspace flake the agent may have
-  edited: the same trust as running `nix build` in that repository yourself.
+- A launch with `forward_packages` builds whatever the named flakes define,
+  including a workspace flake the agent may have edited: the same trust as
+  running `nix build` in that repository yourself.
 - Outbound network is open, so anything readable inside the VM, including
   the entire host nix store, can in principle be sent out. LAN hosts and
   host services listening on non-loopback addresses are reachable.
 - Anything running in the VM can send API requests through the broker while
   the session lasts, and so use your account; it cannot read the token.
-- Plugin directories are shared read-only as they are, so a symlink inside
-  one resolves inside the VM, not on the host.
+- Shared directories are shared as they are, so a symlink inside one
+  resolves inside the VM, not on the host: it reaches a host file only when
+  that file lies in a shared directory too.
 
 ## Requirements
 
@@ -218,8 +225,8 @@ everything else  not shared
 
 ## Tuning
 
-VM size, extra mounts, plugins and forwarded packages are set per project in
-`claudevm.toml` and take effect at the next launch without rebuilding
+VM size, extra mounts, plugin mounts and forwarded packages are set per
+project in `claudevm.toml` and take effect at the next launch without rebuilding
 `claudevm`. `claudevm.vcpu` and `claudevm.memory` in `nix/guest.nix` are the
 defaults that `claudevm init` writes and that apply to a key the file leaves
 out. `claudevm.claudeCode` is the Claude Code of the VM and of

@@ -6,10 +6,30 @@ let
   sockets = map (share: share.socket)
     (builtins.filter (share: share.proto == "virtiofs") guest.microvm.shares);
 
-  # Guest paths the VM itself relies on. An extra share appears in the guest
-  # at its host path, so it must not overlap any of them.
+  # Guest paths the VM itself relies on. Every shared host directory, the
+  # workspace included, appears in the guest at its host path, so none may
+  # overlap any of them.
   guestPaths = [ "/nix" guest.users.users.agent.home ]
     ++ map (share: share.mountPoint) guest.microvm.shares;
+
+  # Guest directories that the system of the VM and Claude Code in it need.
+  # A share may lie under one of them, but a share that contains one would
+  # hide it behind its mount.
+  guestSystemPaths = [
+    "/bin"
+    "/boot"
+    "/dev"
+    "/etc"
+    "/lib"
+    "/proc"
+    "/root"
+    "/run"
+    "/sys"
+    "/tmp"
+    "/usr"
+    "/var"
+    "/tmp/claude-${toString guest.users.users.agent.uid}"
+  ];
 
   configTemplate = ''
     # claudevm reads this file once at launch.
@@ -18,7 +38,7 @@ let
 
     # forward_packages = ["nixpkgs#ripgrep", ".#mytool"]
 
-    # plugins = ["./plugins/mine", "~/code/some-plugin", ".#my-plugin"]
+    # plugin_mounts = ["~/code/some-plugin"]
 
     # [[mounts]]
     # path = "~/data"
@@ -28,7 +48,8 @@ let
   # Checks the JSON form of claudevm.toml. On errors it prints them and
   # exits 1; otherwise it emits NUL-terminated vcpu, memory, the number of
   # mounts, a path and mode (ro or rw) pair per mount, the number of
-  # forward_packages entries, those entries and then the plugins entries.
+  # forward_packages entries, those entries and then the plugin_mounts
+  # entries.
   parseConfig = ''
     def is_positive_integer: type == "number" and (tojson | test("^[1-9][0-9]*$"));
     def unknown_keys($known): keys_unsorted[] | select(IN($known[]) | not);
@@ -42,14 +63,14 @@ let
             else empty end
         end;
     def errors:
-      (unknown_keys(["vcpu", "memory", "forward_packages", "plugins", "mounts", "graphics", "resolution"])
+      (unknown_keys(["vcpu", "memory", "forward_packages", "plugin_mounts", "mounts", "graphics", "resolution"])
         | "unknown key '\(.)'"),
       (("graphics", "resolution") as $key | select(has($key)) | "'\($key)' is not implemented yet"),
       (("vcpu", "memory") as $key
         | select(has($key) and (.[$key] | is_positive_integer | not))
         | "'\($key)' must be a positive integer"),
       string_array_errors("forward_packages"),
-      string_array_errors("plugins"),
+      string_array_errors("plugin_mounts"),
       (select(has("mounts")) | .mounts
         | if type != "array" then "'mounts' must be an array of tables ([[mounts]])"
           else to_entries[] | "[[mounts]] entry \(.key + 1)" as $entry | .value
@@ -74,7 +95,7 @@ let
         ((.mounts // [])[] | .path, (if .writable then "rw" else "ro" end)),
         ((.forward_packages // []) | length),
         ((.forward_packages // [])[]),
-        ((.plugins // [])[])
+        ((.plugin_mounts // [])[])
       end
   '';
 in
@@ -258,14 +279,51 @@ writeShellApplication {
     if [ -e "$HOME/.claude.json" ] || [ -L "$HOME/.claude.json" ]; then
       protected+=("$(realpath -m "$HOME/.claude.json")")
     fi
-    for path in "''${protected[@]}"; do
-      if contains "$workspace" "$path"; then
-        refuse "$workspace as workspace" "it contains $path"
+
+    # The host directories shared with the guest at their host paths, in
+    # the order of the launch input "mounts": virtiofs tag, canonical path,
+    # mode (ro or rw), and the name a refusal of a later, overlapping share
+    # gives it.
+    share_tags=()
+    share_paths=()
+    share_modes=()
+    share_names=()
+
+    # add_share TAG PATH MODE SUBJECT NAME adds canonical directory PATH to
+    # the shares unless the VM must not see it. SUBJECT names PATH in its own
+    # refusal and NAME in the refusal of a later share that overlaps it.
+    add_share() {
+      local tag=$1 path=$2 mode=$3 subject=$4 name=$5 protected_path guest_path i
+      for protected_path in "''${protected[@]}"; do
+        if contains "$path" "$protected_path"; then
+          refuse "$subject" "it contains $protected_path"
+        fi
+      done
+      if [ -n "$claude_dir" ] && contains "$claude_dir" "$path"; then
+        refuse "$subject" "it lies inside $claude_dir"
       fi
-    done
-    if [ -n "$claude_dir" ] && contains "$claude_dir" "$workspace"; then
-      refuse "$workspace as workspace" "it lies inside $claude_dir"
-    fi
+      for guest_path in ${lib.escapeShellArgs guestPaths}; do
+        if overlaps "$guest_path" "$path"; then
+          refuse "$subject" "it overlaps $guest_path, which the VM uses"
+        fi
+      done
+      for guest_path in ${lib.escapeShellArgs guestSystemPaths}; do
+        if contains "$path" "$guest_path"; then
+          refuse "$subject" "it contains $guest_path, which the VM uses"
+        fi
+      done
+      for i in "''${!share_paths[@]}"; do
+        if overlaps "''${share_paths[i]}" "$path"; then
+          refuse "$subject" "it overlaps ''${share_names[i]}"
+        fi
+      done
+      share_tags+=("$tag")
+      share_paths+=("$path")
+      share_modes+=("$mode")
+      share_names+=("$name")
+    }
+
+    add_share workspace "$workspace" rw "$workspace as workspace" "the workspace $workspace"
 
     if ! config_json=$(toml2json claudevm.toml); then
       echo "claudevm: claudevm.toml is not valid TOML" >&2
@@ -312,50 +370,13 @@ writeShellApplication {
     mount_fields=("''${config[@]:3:2 * mount_count}")
     forward_count=''${config[3 + 2 * mount_count]}
     forward_packages=("''${config[@]:4 + 2 * mount_count:forward_count}")
-    plugins=("''${config[@]:4 + 2 * mount_count + forward_count}")
+    plugin_mounts=("''${config[@]:4 + 2 * mount_count + forward_count}")
 
-    # Host directories shared with the guest besides the workspace, each at
-    # its host path, with the claudevm.toml entry that asked for it and its
-    # mode (ro or rw).
-    extra_paths=()
-    extra_entries=()
-    extra_modes=()
-
-    # share_extra PATH ENTRY MODE adds canonical directory PATH to the extra
-    # shares unless the VM must not see it.
-    share_extra() {
-      local path=$1 entry=$2 mode=$3 protected_path guest_path i
-      for protected_path in "''${protected[@]}"; do
-        if contains "$path" "$protected_path"; then
-          refuse "$path ($entry)" "it contains $protected_path"
-        fi
-      done
-      if [ -n "$claude_dir" ] && contains "$claude_dir" "$path"; then
-        refuse "$path ($entry)" "it lies inside $claude_dir"
-      fi
-      if overlaps "$workspace" "$path"; then
-        refuse "$path ($entry)" "it overlaps the workspace $workspace"
-      fi
-      for guest_path in ${lib.escapeShellArgs guestPaths}; do
-        if overlaps "$guest_path" "$path"; then
-          refuse "$path ($entry)" "it overlaps $guest_path, which the VM uses"
-        fi
-      done
-      for i in "''${!extra_paths[@]}"; do
-        if overlaps "''${extra_paths[i]}" "$path"; then
-          refuse "$path ($entry)" "it overlaps ''${extra_paths[i]} of ''${extra_entries[i]}"
-        fi
-      done
-      extra_paths+=("$path")
-      extra_entries+=("$entry")
-      extra_modes+=("$mode")
-    }
-
-    mount_paths=()
-    mount_modes=()
-    for ((i = 0; i < ''${#mount_fields[@]}; i += 2)); do
-      entry="[[mounts]] entry $((i / 2 + 1))"
-      path=''${mount_fields[i]}
+    # resolve_entry_dir ENTRY PATH sets entry_dir to the canonical path of
+    # the directory that claudevm.toml entry ENTRY names by PATH, which is
+    # absolute or starts with ~/.
+    resolve_entry_dir() {
+      local entry=$1 path=$2
       case $path in
         \~/*) path=$HOME/''${path#\~/} ;;
         /*) ;;
@@ -364,54 +385,59 @@ writeShellApplication {
       if [ ! -e "$path" ]; then
         refuse "$path ($entry)" "it does not exist"
       fi
-      mount_path=$(realpath -e -- "$path")
-      if [ ! -d "$mount_path" ]; then
-        refuse "$mount_path ($entry)" "it is not a directory"
+      entry_dir=$(realpath -e -- "$path")
+      if [ ! -d "$entry_dir" ]; then
+        refuse "$entry_dir ($entry)" "it is not a directory"
       fi
-      share_extra "$mount_path" "$entry" "''${mount_fields[i + 1]}"
-      mount_paths+=("$mount_path")
-      mount_modes+=("''${mount_fields[i + 1]}")
+    }
+
+    mount_paths=()
+    mount_modes=()
+    for ((i = 0; i < ''${#mount_fields[@]}; i += 2)); do
+      entry="[[mounts]] entry $((i / 2 + 1))"
+      mode=''${mount_fields[i + 1]}
+      resolve_entry_dir "$entry" "''${mount_fields[i]}"
+      add_share "extra''${#share_paths[@]}" "$entry_dir" "$mode" "$entry_dir ($entry)" "$entry_dir of $entry"
+      mount_paths+=("$entry_dir")
+      mount_modes+=("$mode")
     done
 
-    # A plugins entry that starts with /, ~/ or ./ is a plugin directory on
-    # the host, with ./ relative to the workspace. The guest reads one inside
-    # the workspace through /workspace and any other through an extra share.
-    # Every other entry is a flake installable whose single output is the
-    # plugin directory, which the guest reads through its store share.
-    #   plugin_kinds[i]        workspace, shared or store
-    #   plugin_guest_paths[i]  directory the guest loads the plugin from
-    plugin_kinds=()
-    plugin_guest_paths=()
-    for i in "''${!plugins[@]}"; do
-      entry="plugins entry $((i + 1))"
-      path=''${plugins[i]}
-      case $path in
-        /*) ;;
-        \~/*) path=$HOME/''${path#\~/} ;;
-        ./*) path=$workspace/''${path#./} ;;
-        *)
-          plugin_kinds[i]=store
-          continue
-          ;;
-      esac
-      if [ ! -e "$path" ]; then
-        config_error "$entry: $path does not exist"
+    # in_shared_dir PATH succeeds when canonical PATH lies inside the
+    # workspace or a [[mounts]] directory, through which the guest already
+    # sees it at the same path.
+    in_shared_dir() {
+      local share_path
+      for share_path in "$workspace" "''${mount_paths[@]}"; do
+        if contains "$share_path" "$1"; then
+          return 0
+        fi
+      done
+      return 1
+    }
+
+    # The plugin_mounts directories in claudevm.toml order, each with "own"
+    # when it has a read-only share of its own and "within" when the guest
+    # sees it through the workspace or a [[mounts]] share.
+    plugin_dirs=()
+    plugin_shares=()
+    for i in "''${!plugin_mounts[@]}"; do
+      entry="plugin_mounts entry $((i + 1))"
+      resolve_entry_dir "$entry" "''${plugin_mounts[i]}"
+      if [ ! -f "$entry_dir/.claude-plugin/plugin.json" ]; then
+        config_error "$entry: $entry_dir is not a Claude Code plugin: .claude-plugin/plugin.json is missing"
       fi
-      plugin_path=$(realpath -e -- "$path")
-      if [ ! -d "$plugin_path" ]; then
-        config_error "$entry: $plugin_path is not a directory"
-      fi
-      if [ ! -f "$plugin_path/.claude-plugin/plugin.json" ]; then
-        config_error "$entry: $plugin_path is not a Claude Code plugin: .claude-plugin/plugin.json is missing"
-      fi
-      if contains "$workspace" "$plugin_path"; then
-        plugin_kinds[i]=workspace
-        plugin_guest_paths[i]=/workspace''${plugin_path#"$workspace"}
+      for j in "''${!plugin_dirs[@]}"; do
+        if overlaps "''${plugin_dirs[j]}" "$entry_dir"; then
+          refuse "$entry_dir ($entry)" "it overlaps ''${plugin_dirs[j]} of plugin_mounts entry $((j + 1))"
+        fi
+      done
+      if in_shared_dir "$entry_dir"; then
+        plugin_shares+=(within)
       else
-        share_extra "$plugin_path" "$entry" ro
-        plugin_kinds[i]=shared
-        plugin_guest_paths[i]=$plugin_path
+        add_share "extra''${#share_paths[@]}" "$entry_dir" ro "$entry_dir ($entry)" "$entry_dir of $entry"
+        plugin_shares+=(own)
       fi
+      plugin_dirs+=("$entry_dir")
     done
 
     if [ ! -w /dev/kvm ]; then
@@ -467,8 +493,7 @@ writeShellApplication {
     # download in the VM. The working directory is still the workspace, so
     # relative flake references resolve against it. Each out-link in the
     # runtime directory is a GC root that keeps the build for the session;
-    # nix names it fwd<entry> or plg<entry>, plus -<output> for an output
-    # other than out.
+    # nix names it fwd<entry>, plus -<output> for an output other than out.
     forward_installables=()
     forward_dirs=()
     for i in "''${!forward_packages[@]}"; do
@@ -495,30 +520,6 @@ writeShellApplication {
       fi
       forward_installables+=("$installable")
       forward_dirs+=("''${bin_dirs[@]}")
-    done
-
-    for i in "''${!plugins[@]}"; do
-      if [ "''${plugin_kinds[i]}" != store ]; then
-        continue
-      fi
-      entry="plugins entry $((i + 1))"
-      installable=''${plugins[i]}
-      if ! out_paths=$(nix build --print-out-paths --out-link "$runtime/plg$((i + 1))" -- "$installable"); then
-        config_error "$entry: building '$installable' failed"
-      fi
-      mapfile -t plugin_outputs <<< "$out_paths"
-      if [ "''${#plugin_outputs[@]}" -ne 1 ]; then
-        config_error "$entry: '$installable' built ''${#plugin_outputs[@]} outputs, ''${plugin_outputs[*]}; a plugin must be exactly one"
-      fi
-      plugin_path=''${plugin_outputs[0]}
-      case $plugin_path in
-        /nix/store/*) ;;
-        *) config_error "$entry: '$installable' built $plugin_path, which lies outside /nix/store, the only store the VM sees" ;;
-      esac
-      if [ ! -f "$plugin_path/.claude-plugin/plugin.json" ]; then
-        config_error "$entry: '$installable' built $plugin_path, which is not a Claude Code plugin: .claude-plugin/plugin.json is missing"
-      fi
-      plugin_guest_paths[i]=$plugin_path
     done
 
     if [ -f "$workspace/.git" ]; then
@@ -562,12 +563,11 @@ writeShellApplication {
       for i in "''${!mount_paths[@]}"; do
         printf 'claudevm: %-9s  %s  %s  (claudevm.toml)\n' mount "''${mount_modes[i]}" "''${mount_paths[i]}"
       done
-      for i in "''${!plugins[@]}"; do
-        if [ "''${plugin_kinds[i]}" = shared ]; then
-          printf 'claudevm: %-9s  ro  %s  (claudevm.toml)\n' plugin "''${plugin_guest_paths[i]}"
-        else
-          printf 'claudevm: %-9s  %s  (claudevm.toml)\n' plugin "''${plugin_guest_paths[i]}"
-        fi
+      for i in "''${!plugin_dirs[@]}"; do
+        case ''${plugin_shares[i]} in
+          own) printf 'claudevm: %-9s  ro  %s  (claudevm.toml)\n' plugin "''${plugin_dirs[i]}" ;;
+          within) printf 'claudevm: %-9s  %s  (claudevm.toml)\n' plugin "''${plugin_dirs[i]}" ;;
+        esac
       done
       for installable in "''${forward_installables[@]}"; do
         printf 'claudevm: %-9s  %s  (claudevm.toml)\n' forward "$installable"
@@ -578,7 +578,6 @@ writeShellApplication {
       echo "claudevm: claude config: image defaults only; token stays on the host; network: outbound only, host loopback blocked except the broker"
     } >&2
 
-    ln -s "$workspace" "$runtime/workspace"
     mkdir "$runtime/launch"
 
     {
@@ -590,28 +589,29 @@ writeShellApplication {
         printf 'COLS=%q\n' "''${size#* }"
       fi
       printf 'CLAUDEVM_SESSION=%q\n' "$session"
+      printf 'CLAUDEVM_WORKSPACE=%q\n' "$workspace"
       printf 'CLAUDEVM_BROKER_PORT=%q\n' "$broker_port"
       printf 'CLAUDEVM_GUEST_KEY=%q\n' "$guest_key"
     } > "$runtime/launch/env"
 
     for arg in "$@"; do printf '%s\0' "$arg"; done > "$runtime/launch/claude-args"
 
-    # Tag, guest path and mode of each extra share, read by virtiofsd-run,
-    # by the QEMU argument script and by the guest. Each tag is served on
-    # the socket <tag>.sock.
-    extra_sockets=()
-    for i in "''${!extra_paths[@]}"; do
-      printf 'extra%s\0%s\0%s\0' "$i" "''${extra_paths[i]}" "''${extra_modes[i]}"
-      extra_sockets+=("extra$i.sock")
+    # Tag, path and mode of each share, read by virtiofsd-run, by the QEMU
+    # argument script and by the guest, which mounts it at the same path as
+    # the host has it. Each tag is served on the socket <tag>.sock.
+    share_sockets=()
+    for i in "''${!share_paths[@]}"; do
+      printf '%s\0%s\0%s\0' "''${share_tags[i]}" "''${share_paths[i]}" "''${share_modes[i]}"
+      share_sockets+=("''${share_tags[i]}.sock")
     done > "$runtime/launch/mounts"
 
     # Bin directories of the forward_packages, read by the guest, which puts
     # them first on PATH in this order.
     for dir in "''${forward_dirs[@]}"; do printf '%s\0' "$dir"; done > "$runtime/launch/forward-path"
 
-    # Guest paths of the plugin directories, read by the guest, which loads
-    # each into Claude Code in this order.
-    for dir in "''${plugin_guest_paths[@]}"; do printf '%s\0' "$dir"; done > "$runtime/launch/plugin-dirs"
+    # Paths of the plugin_mounts directories, which the guest sees at their
+    # host paths and loads into Claude Code in this order.
+    for dir in "''${plugin_dirs[@]}"; do printf '%s\0' "$dir"; done > "$runtime/launch/plugin-dirs"
 
     git_before=$(git_fingerprint) || git_before=unreadable
 
@@ -623,7 +623,7 @@ writeShellApplication {
 
     # qemu connects to every vhost-user socket at startup and fails if one
     # is missing.
-    for sock in ${lib.escapeShellArgs sockets} "''${extra_sockets[@]}"; do
+    for sock in ${lib.escapeShellArgs sockets} "''${share_sockets[@]}"; do
       tries=0
       until [ -S "$sock" ]; do
         tries=$((tries + 1))

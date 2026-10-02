@@ -5,12 +5,11 @@ let
   agent = config.users.users.agent;
   agentGid = config.users.groups.${agent.group}.gid;
 
-  # Relative share sources resolve against the runtime directory the
-  # claudevm wrapper cds into before starting virtiofsd. There "workspace"
-  # is a symlink to the host's working directory and "launch" is a plain
-  # directory of per-invocation launch input. The trailing /. makes the
-  # symlink an intermediate path component: virtiofsd opens the share root
-  # with O_NOFOLLOW and rejects a bare symlink.
+  # The shares every launch has. Relative share sources resolve against the
+  # runtime directory the claudevm wrapper cds into before starting
+  # virtiofsd, where "launch" is a plain directory of per-invocation launch
+  # input. The workspace and the other host directories of a launch come
+  # from the launch input "mounts" instead.
   shares = [
     {
       tag = "ro-store";
@@ -18,13 +17,6 @@ let
       mountPoint = "/nix/.ro-store";
       proto = "virtiofs";
       readOnly = true;
-      posixAcl = false;
-    }
-    {
-      tag = "workspace";
-      source = "workspace/.";
-      mountPoint = "/workspace";
-      proto = "virtiofs";
       posixAcl = false;
     }
     {
@@ -37,10 +29,10 @@ let
     }
   ];
 
-  # The launch input "mounts" lists the extra mounts of a launch as
-  # NUL-terminated tag, path, mode (ro or rw) triples. The host serves each
-  # tag on the socket <tag>.sock and the guest mounts it at path, the same
-  # absolute path the directory has on the host.
+  # The launch input "mounts" lists the host directories a launch shares,
+  # the workspace first, as NUL-terminated tag, path, mode (ro or rw)
+  # triples. The host serves each tag on the socket <tag>.sock and the guest
+  # mounts it at path, the same absolute path the directory has on the host.
   readMount = ''IFS= read -r -d "" tag && IFS= read -r -d "" path && IFS= read -r -d "" mode'';
 
   # The launch input "forward-path" lists the bin directories of the
@@ -52,13 +44,13 @@ let
   '';
 
   # Emits the per-launch QEMU arguments: the VM size from CLAUDEVM_VCPU and
-  # CLAUDEVM_MEM (MiB) and a vhost-user-fs device per extra mount. QEMU
-  # applies the last -smp and -m it is given, so these override the baked
-  # ones. The baked memory backend of NUMA node 0 has the fixed size
-  # microvm.mem and the backends of all nodes must add up to -m, so the rest
-  # of the requested RAM forms a second node. microvm.mem is therefore also
-  # the smallest RAM a launch can have. Runs with the runtime directory as
-  # working directory, like virtiofsd-run.
+  # CLAUDEVM_MEM (MiB) and a vhost-user-fs device per entry of the launch
+  # input "mounts". QEMU applies the last -smp and -m it is given, so these
+  # override the baked ones. The baked memory backend of NUMA node 0 has the
+  # fixed size microvm.mem and the backends of all nodes must add up to -m,
+  # so the rest of the requested RAM forms a second node. microvm.mem is
+  # therefore also the smallest RAM a launch can have. Runs with the runtime
+  # directory as working directory, like virtiofsd-run.
   launchArgs = pkgs.writeShellApplication {
     name = "claudevm-launch-args";
     text = ''
@@ -98,7 +90,12 @@ let
   # claudevm-home adds the guest key of the launch to the approved custom
   # API keys. Claude Code looks an approved key up by its last 20
   # characters; the full key is approved as well so that either lookup
-  # matches.
+  # matches. claudevm-home also sets hasTrustDialogAccepted for the
+  # workspace, the record of an accepted workspace trust dialog. Claude
+  # Code requires it, in an interactive session and in a -p run alike,
+  # before it applies the hooks, permissions, extraKnownMarketplaces and
+  # enabledPlugins of a repository's .claude/settings.json and loads the
+  # plugins under its .claude/skills/<name>/.
   claudeState = pkgs.writeText "claude.json" (builtins.toJSON {
     hasCompletedOnboarding = true;
     theme = "dark";
@@ -117,8 +114,9 @@ let
       # shellcheck disable=SC1091
       . /mnt/launch/env
       set +a
-      # Claude Code trusts its working directory and skips the trust dialog
-      # when this says it runs in a sandbox.
+      # Claude Code shows no workspace trust dialog when this says it runs
+      # in a sandbox. The trust that repository content needs comes from
+      # hasTrustDialogAccepted in ~/.claude.json, which claudevm-home sets.
       export CLAUDE_CODE_SANDBOXED=1
       # The guest key is all the guest holds. The broker on the host
       # loopback, which QEMU forwards 10.0.2.2 to, swaps it for the token.
@@ -139,6 +137,7 @@ let
       for dir in "''${plugin_dirs[@]}"; do
         plugin_args+=(--plugin-dir "$dir")
       done
+      cd "$CLAUDEVM_WORKSPACE"
       case $CLAUDEVM_SESSION in
         claude) exec claude --dangerously-skip-permissions "''${plugin_args[@]}" "''${args[@]}" ;;
         shell) exec bash -l ;;
@@ -219,10 +218,10 @@ in
 
     # The stock virtiofsd-run wraps the daemons in supervisord with
     # user=root, which refuses to start for an unprivileged user. This
-    # replacement starts one virtiofsd per share and per extra mount
-    # directly. Of the share options it honors socket, source, cache and
-    # readOnly; posixAcl and extraArgs are not passed. It exits as soon as
-    # any daemon exits.
+    # replacement starts one virtiofsd per share and per entry of the launch
+    # input "mounts" directly. Of the share options it honors socket,
+    # source, cache and readOnly; posixAcl and extraArgs are not passed. It
+    # exits as soon as any daemon exits.
     microvm.binScripts.virtiofsd-run =
       let
         virtiofsShares = builtins.filter
@@ -326,7 +325,7 @@ in
     ];
 
     systemd.services.claudevm-home = {
-      description = "Prepare agent home, broker access and extra mounts from the launch share";
+      description = "Prepare agent home, broker access and shared directories from the launch share";
       requires = [ "nftables.service" ];
       after = [ "nftables.service" ];
       unitConfig.RequiresMountsFor = [ "/mnt/launch" ];
@@ -342,17 +341,20 @@ in
         . /mnt/launch/env
         : "''${CLAUDEVM_BROKER_PORT:?is not set in /mnt/launch/env}"
         : "''${CLAUDEVM_GUEST_KEY:?is not set in /mnt/launch/env}"
+        : "''${CLAUDEVM_WORKSPACE:?is not set in /mnt/launch/env}"
         nft insert rule inet host-loopback output \
           ip daddr 10.0.2.2 tcp dport "$CLAUDEVM_BROKER_PORT" accept
         install -d -o ${agent.name} -g ${agent.group} -m 0700 ${agent.home}/.claude
         install -o ${agent.name} -g ${agent.group} -m 0600 ${claudeSettings} ${agent.home}/.claude/settings.json
         install -o ${agent.name} -g ${agent.group} -m 0600 /dev/null ${agent.home}/.claude.json
-        jq --arg key "$CLAUDEVM_GUEST_KEY" \
-          '.customApiKeyResponses.approved = [$key, $key[-20:]]' \
+        jq --arg key "$CLAUDEVM_GUEST_KEY" --arg workspace "$CLAUDEVM_WORKSPACE" \
+          '.customApiKeyResponses.approved = [$key, $key[-20:]]
+           | .projects[$workspace].hasTrustDialogAccepted = true' \
           ${claudeState} > ${agent.home}/.claude.json
         # Claude Code refuses to run when /tmp/claude-<uid>, the directory it
-        # keeps its temporary files in, belongs to another user. An extra
-        # mount whose path lies under it would leave it owned by root.
+        # keeps its temporary files in, belongs to another user. It is
+        # created before the mounts, since the mount loop creates the missing
+        # parents of a share's path owned by root.
         install -d -o ${agent.name} -g ${agent.group} -m 0700 /tmp/claude-${toString agent.uid}
         # The host enforces ro with virtiofsd --readonly; the ro mount
         # option makes the guest report it up front.
@@ -368,14 +370,13 @@ in
       requires = [ "claudevm-home.service" ];
       wants = [ "network-online.target" ];
       after = [ "claudevm-home.service" "network-online.target" ];
-      unitConfig.RequiresMountsFor = [ "/workspace" "/mnt/launch" ];
+      unitConfig.RequiresMountsFor = [ "/mnt/launch" ];
       wantedBy = [ "multi-user.target" ];
       path = [ "/run/current-system/sw" ];
       serviceConfig = {
         Type = "idle";
         User = agent.name;
         Group = agent.group;
-        WorkingDirectory = "/workspace";
         StandardInput = "tty";
         StandardOutput = "tty";
         StandardError = "tty";
