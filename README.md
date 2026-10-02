@@ -150,8 +150,10 @@ plugin_mounts dirs  ro   --->   same path
 token               brokered    the guest holds a per-session dummy key
 ~/.claude           not shared
 ~/.claude.json      not shared
-host loopback       blocked except the broker's port
-internet, LAN       outbound only, nothing inbound
+host loopback       blocked except the broker's port and DNS
+LAN                 blocked except DNS, as are CGNAT, link-local, multicast
+host's resolver     DNS through 10.0.2.3, which QEMU forwards to it
+internet            outbound over IPv4 only, nothing inbound
 everything else     not shared
 ```
 
@@ -185,11 +187,23 @@ everything else     not shared
   guest tells Claude Code that it runs in a sandbox, which keeps the trust
   prompt away, and the image's defaults carry the answers, including the
   trust of the workspace and the approval of the session's key.
-- Network: QEMU user-mode networking with DHCP and QEMU's DNS resolver. The
-  guest firewall rejects 10.0.2.2 and fec0::2, through which QEMU would
-  reach the host's loopback services, except the broker's TCP port on
-  10.0.2.2, which the guest admits at boot.
+- Network: QEMU user-mode networking with DHCP and DNS, over IPv4 only;
+  IPv6 is off. QEMU sends guest traffic out through the host's network
+  stack, so the guest firewall rejects the destinations that are the host
+  or its LAN: private, CGNAT, link-local, multicast and broadcast
+  addresses, among them 10.0.2.2, through which QEMU reaches the host's
+  loopback services. It makes three exceptions: the DHCP client's requests
+  to QEMU at 10.0.2.2; DNS through 10.0.2.3, which QEMU forwards to the
+  first nameserver in the host's `/etc/resolv.conf`, such as
+  systemd-resolved on the host's loopback or a router on the LAN; and the
+  broker's TCP port on 10.0.2.2, which the guest admits at boot.
 - Nix: flakes are enabled; `nix develop` and `nix build` work inside.
+- Hardening: the guest has no nested virtualization, no user namespaces, no
+  io_uring and no setuid or file-capability programs, `sudo` included. Its
+  kernel loads no line discipline on demand and none of the blacklisted
+  modules of unused devices, socket families and netlink protocols. Claude
+  Code's own sandbox mode and other tools built on bubblewrap therefore do
+  not work in the VM; `nix build` does.
 - Git: `claudevm` warns at launch if `.git` is a file (linked worktrees,
   submodules); git will not work inside the VM then. After the session it
   prints a NOTICE if `.git`, `.git/config` or `.git/hooks` changed.
@@ -205,11 +219,18 @@ everything else     not shared
 - A launch with `forward_packages` builds whatever the named flakes define,
   including a workspace flake the agent may have edited: the same trust as
   running `nix build` in that repository yourself.
-- Outbound network is open, so anything readable inside the VM, including
-  the entire host nix store, can in principle be sent out. LAN hosts and
-  host services listening on non-loopback addresses are reachable.
+- The internet is open, so anything readable inside the VM, including the
+  entire host nix store, can in principle be sent out.
+- A host service listening on a public IPv4 address of the host is
+  reachable: the guest firewall tells destinations apart by address range
+  and cannot tell the host's public address from the rest of the internet.
+- Everything that runs in the VM is one trust domain with one guest key: a
+  dependency, a build script or an MCP server there can do whatever the
+  agent can.
 - Anything running in the VM can send API requests through the broker while
   the session lasts, and so use your account; it cannot read the token.
+- The workspace and writable mounts can grow until the host filesystem they
+  live on is full, so a runaway process in the VM can fill the host disk.
 - Shared directories are shared as they are, so a symlink inside one
   resolves inside the VM, not on the host: it reaches a host file only when
   that file lies in a shared directory too.

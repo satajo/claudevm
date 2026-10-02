@@ -118,9 +118,12 @@ let
       # in a sandbox. The trust that repository content needs comes from
       # hasTrustDialogAccepted in ~/.claude.json, which claudevm-home sets.
       export CLAUDE_CODE_SANDBOXED=1
-      # The guest key is all the guest holds. The broker on the host
-      # loopback, which QEMU forwards 10.0.2.2 to, swaps it for the token.
+      # The guest key is all the guest holds, and the session's
+      # environment carries it only as ANTHROPIC_API_KEY. The broker on the
+      # host loopback, which QEMU forwards 10.0.2.2 to, swaps it for the
+      # token.
       export ANTHROPIC_API_KEY=$CLAUDEVM_GUEST_KEY
+      unset CLAUDEVM_GUEST_KEY
       export ANTHROPIC_BASE_URL=http://10.0.2.2:$CLAUDEVM_BROKER_PORT
       export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
       export DISABLE_AUTOUPDATER=1
@@ -187,7 +190,15 @@ in
     microvm = {
       hypervisor = "qemu";
       mem = 512;
+      # The host CPU without the virtualization extensions svm and vmx, so
+      # the guest kernel cannot run a hypervisor, and without sgx, with
+      # which QEMU's microvm machine crashes.
+      cpu = "host,+x2apic,-sgx,-svm,-vmx";
       qemu = {
+        # microvm.nix defaults to the QEMU of every target architecture once
+        # microvm.cpu is set; qemu_kvm, built for the host's architecture
+        # only, keeps the closure about 600 MiB smaller.
+        package = pkgs.qemu_kvm;
         # The runner's own serial console adds earlyprintk=ttyS0 to the
         # kernel command line, which makes the boot loader and the kernel
         # report their progress on the console the session appears on.
@@ -202,6 +213,9 @@ in
           "${config.microvm.qemu.package}/share/qemu/qboot.rom"
           "-serial"
           "chardev:stdio"
+          # -enable-kvm, which the runner passes only while microvm.cpu is
+          # unset, makes KVM required rather than tried before TCG.
+          "-enable-kvm"
         ];
       };
       extraArgsScript = lib.getExe launchArgs;
@@ -277,23 +291,104 @@ in
       anyInterface = true;
     };
 
-    # slirp forwards guest traffic for 10.0.2.2 and fec0::2 to the host's
-    # loopback interface. DHCP to the slirp server at 10.0.2.2 stays open,
-    # and claudevm-home admits the broker port of the launch at boot.
+    # Over IPv6, slirp would reach the host and the LAN at their global
+    # addresses, which no fixed range describes.
+    networking.enableIPv6 = false;
+
+    # The guest's one interface gets IPv4 over DHCP and nothing over IPv6:
+    # without link-local addressing, networkd leaves IPv6 disabled on it
+    # and runs no router discovery. networkd applies the first matching
+    # unit in lexical order, so this one wins over NixOS's generic
+    # 99-ethernet-default-dhcp.
+    systemd.network.networks."10-usernet" = {
+      matchConfig.MACAddress = (lib.head config.microvm.interfaces).mac;
+      networkConfig = {
+        DHCP = "ipv4";
+        LinkLocalAddressing = "no";
+      };
+    };
+
+    # Of everything outside the guest, only the internet over IPv4 is
+    # reachable, with three exceptions: DHCP to slirp at 10.0.2.2; DNS
+    # through 10.0.2.3, which slirp forwards to the first nameserver of the
+    # host's resolv.conf, which may be on the host's loopback or its LAN;
+    # and the broker port of the launch, which claudevm-home admits at
+    # boot. slirp sends guest traffic out through the host's network stack,
+    # so a private, CGNAT or link-local destination is the host or its LAN,
+    # and multicast reaches no further than the LAN; slirp hands 10.0.2.2
+    # and the broadcast address 255.255.255.255 to the host's loopback.
+    # networkd sends DHCP renewals and releases from port 68, a privileged
+    # port that agent cannot bind, and its other DHCP messages over a
+    # packet socket, which this hook does not see. reject makes a refused
+    # connection fail at once.
     networking.nftables = {
       enable = true;
-      tables.host-loopback = {
+      tables.egress = {
         family = "inet";
         content = ''
           chain output {
             type filter hook output priority filter; policy accept;
-            ip daddr 10.0.2.2 udp dport 67 accept
-            ip daddr 10.0.2.2 reject
-            ip6 daddr fec0::2 reject
+            oif "lo" accept
+            ip daddr 10.0.2.2 udp sport 68 udp dport 67 accept
+            ip daddr 10.0.2.3 meta l4proto { tcp, udp } th dport 53 accept
+            ip daddr {
+              10.0.0.0/8,
+              100.64.0.0/10,
+              169.254.0.0/16,
+              172.16.0.0/12,
+              192.168.0.0/16,
+              224.0.0.0/4,
+              255.255.255.255
+            } reject
+            meta nfproto ipv6 reject
           }
         '';
       };
     };
+
+    # Opening a static device node, creating a socket of an unregistered
+    # family or netlink protocol and looking up a generic netlink family by
+    # name make the kernel load the module behind it, for any user. The
+    # guest uses none of these modules.
+    boot.blacklistedKernelModules = [
+      # The host side of virtualization: vhost and VFIO devices and the
+      # vsock family.
+      "vhost" "vhost_net" "vhost_vsock"
+      "vsock" "vsock_diag" "vsock_loopback" "hv_sock" "vmw_vsock_vmci_transport"
+      "vmw_vsock_virtio_transport" "vmw_vsock_virtio_transport_common"
+      "vfio" "vfio_iommu_type1" "vfio_pci"
+      # Socket families, the sock_diag modules that load them, and netlink
+      # protocols.
+      "af_alg" "af_key" "appletalk" "atm" "ax25" "bluetooth" "caif_socket"
+      "can" "ieee802154_socket" "kcm" "l2tp_ip" "l2tp_ip6" "llc2"
+      "mpls_router" "netrom" "nfc" "phonet" "pppox" "qrtr" "rds" "rose"
+      "rxrpc" "sctp" "sctp_diag" "smc" "smc_diag" "tipc" "tipc_diag" "x25"
+      "crypto_user" "ib_core" "scsi_transport_iscsi" "xfrm_user"
+      # The tun device.
+      "tun"
+      # Generic netlink families.
+      "wireguard" "openvswitch" "ip_vs" "batman_adv" "gtp" "macsec" "nbd"
+      "l2tp_netlink" "ovpn" "cfg80211"
+    ];
+
+    boot.kernel.sysctl = {
+      # Refuses io_uring_setup to every process, root included.
+      "kernel.io_uring_disabled" = 2;
+      # TIOCSETD on any terminal, a pty included, would otherwise load the
+      # line discipline module it names.
+      "dev.tty.ldisc_autoload" = 0;
+      # No user namespaces, not even for root. Setting
+      # security.allowUserNamespaces = false has the same effect but also
+      # requires nix.settings.sandbox = false, while the Nix daemon builds
+      # in its sandbox without user namespaces.
+      "user.max_user_namespaces" = 0;
+    };
+
+    # Root is locked and the session starts as agent, so no program in the
+    # guest needs to raise privileges: no sudo, and no setuid or
+    # file-capability wrappers such as su, mount or newuidmap.
+    security.sudo.enable = false;
+    security.enableWrappers = false;
 
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
@@ -342,7 +437,7 @@ in
         : "''${CLAUDEVM_BROKER_PORT:?is not set in /mnt/launch/env}"
         : "''${CLAUDEVM_GUEST_KEY:?is not set in /mnt/launch/env}"
         : "''${CLAUDEVM_WORKSPACE:?is not set in /mnt/launch/env}"
-        nft insert rule inet host-loopback output \
+        nft insert rule inet egress output \
           ip daddr 10.0.2.2 tcp dport "$CLAUDEVM_BROKER_PORT" accept
         install -d -o ${agent.name} -g ${agent.group} -m 0700 ${agent.home}/.claude
         install -o ${agent.name} -g ${agent.group} -m 0600 ${claudeSettings} ${agent.home}/.claude/settings.json

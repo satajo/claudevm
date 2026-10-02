@@ -575,9 +575,15 @@ writeShellApplication {
       printf 'claudevm: %-9s  %s%s\n' vcpu "$vcpu" "$vcpu_note"
       printf 'claudevm: %-9s  %s MiB%s\n' memory "$memory" "$memory_note"
       printf 'claudevm: %-9s  127.0.0.1:%s -> api.anthropic.com  (token %s)\n' broker "$broker_port" "$token_file"
-      echo "claudevm: claude config: image defaults only; token stays on the host; network: outbound only, host loopback blocked except the broker"
+      echo "claudevm: claude config: image defaults only; token stays on the host; network: IPv4 internet only; LAN, CGNAT, link-local, multicast and host loopback blocked except the broker and DNS"
     } >&2
 
+    # From here on the launcher creates files and directories that only
+    # their owner can access; virtiofsd sets its own umask for the files
+    # the guest creates. The guest sees the launch input at /mnt/launch with
+    # its owner mapped to agent, so in the guest only agent and root can
+    # read it, the guest key in env included.
+    umask 077
     mkdir "$runtime/launch"
 
     {
