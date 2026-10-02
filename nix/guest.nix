@@ -43,6 +43,20 @@ let
     PATH="$(${lib.getExe' pkgs.coreutils "tr"} '\0' : < /mnt/launch/forward-path)$PATH"
   '';
 
+  # Each virtiofsd lets the guest hold CLAUDEVM_SHARE_FDS host descriptors,
+  # which the launcher writes into /mnt/launch/env: one for every inode of
+  # its share that the guest kernel holds and one more for every open file
+  # and directory. Once the guest holds them all, the daemon answers every
+  # further open, and every lookup of an inode the guest does not hold yet,
+  # with ENFILE; the host itself never runs out. This sets share_fds.
+  shareBudget = ''
+    share_fds=''${CLAUDEVM_SHARE_FDS:?is not set in /mnt/launch/env}
+    if ! [[ $share_fds =~ ^[1-9][0-9]*$ ]]; then
+      echo "CLAUDEVM_SHARE_FDS=$share_fds is not a positive integer" >&2
+      exit 1
+    fi
+  '';
+
   # Emits the per-launch QEMU arguments: the VM size from CLAUDEVM_VCPU and
   # CLAUDEVM_MEM (MiB) and a vhost-user-fs device per entry of the launch
   # input "mounts". QEMU applies the last -smp and -m it is given, so these
@@ -166,6 +180,16 @@ in
       defaultText = lib.literalExpression "pkgs.claude-code";
       description = "Claude Code package of the guest, also used by claudevm login on the host.";
     };
+    virtiofsdReservedFds = lib.mkOption {
+      type = lib.types.ints.positive;
+      readOnly = true;
+      default = 609;
+      description = ''
+        Descriptors that virtiofsd 1.14.0 keeps for itself besides one per
+        thread of its pool: 509, one per memory region vhost-user can map,
+        and 100 more. The guest may hold the rest of the daemon's limit.
+      '';
+    };
   };
 
   config = {
@@ -184,6 +208,10 @@ in
       {
         assertion = cfg.memory >= config.microvm.mem;
         message = "claudevm.memory must be at least microvm.mem (${toString config.microvm.mem} MiB)";
+      }
+      {
+        assertion = config.microvm.virtiofsd.package.version == "1.14.0";
+        message = "claudevm.virtiofsdReservedFds is the descriptor reserve of virtiofsd 1.14.0; check it against virtiofsd ${config.microvm.virtiofsd.package.version} and update the version in this assertion";
       }
     ];
 
@@ -235,7 +263,11 @@ in
     # replacement starts one virtiofsd per share and per entry of the launch
     # input "mounts" directly. Of the share options it honors socket,
     # source, cache and readOnly; posixAcl and extraArgs are not passed. It
-    # exits as soon as any daemon exits.
+    # exits as soon as any daemon exits. Each daemon runs
+    # CLAUDEVM_SHARE_THREADS threads, in place of
+    # microvm.virtiofsd.threadPoolSize, and may hold CLAUDEVM_SHARE_NOFILE
+    # descriptors; the launcher sets both and derives from them how many
+    # descriptors the guest may hold.
     microvm.binScripts.virtiofsd-run =
       let
         virtiofsShares = builtins.filter
@@ -245,6 +277,8 @@ in
       lib.mkForce ''
         set -euo pipefail
         trap 'kill $(jobs -p) 2>/dev/null || true; wait' EXIT
+        nofile=''${CLAUDEVM_SHARE_NOFILE:?is not set}
+        threads=''${CLAUDEVM_SHARE_THREADS:?is not set}
         uid=$(${lib.getExe' pkgs.coreutils "id"} -u)
         gid=$(${lib.getExe' pkgs.coreutils "id"} -g)
         # serve SOCKET DIR CACHE ro|rw
@@ -257,7 +291,8 @@ in
             --socket-path="$1" \
             --shared-dir="$2" \
             --cache="$3" \
-            --thread-pool-size ${toString config.microvm.virtiofsd.threadPoolSize} \
+            --thread-pool-size "$threads" \
+            --rlimit-nofile "$nofile" \
             --translate-uid map:${toString agent.uid}:"$uid":1 \
             --translate-gid map:${toString agentGid}:"$gid":1 \
             "''${readonly_flag[@]}" &
@@ -357,6 +392,9 @@ in
       "vsock" "vsock_diag" "vsock_loopback" "hv_sock" "vmw_vsock_vmci_transport"
       "vmw_vsock_virtio_transport" "vmw_vsock_virtio_transport_common"
       "vfio" "vfio_iommu_type1" "vfio_pci"
+      # KVM, with which the guest would host VMs of its own; microvm.cpu
+      # already hides the svm and vmx extensions it needs.
+      "kvm" "kvm_amd" "kvm_intel"
       # Socket families, the sock_diag modules that load them, and netlink
       # protocols.
       "af_alg" "af_key" "appletalk" "atm" "ax25" "bluetooth" "caif_socket"
@@ -383,6 +421,14 @@ in
       # in its sandbox without user namespaces.
       "user.max_user_namespaces" = 0;
     };
+
+    # The process that opens /dev/fuse can serve a FUSE file system, which
+    # only root can mount: the guest has no setuid fusermount and no user
+    # namespaces. The fuse module itself stays loaded, as virtiofs is built
+    # on it.
+    services.udev.extraRules = ''
+      SUBSYSTEM=="misc", KERNEL=="fuse", MODE="0600"
+    '';
 
     # Root is locked and the session starts as agent, so no program in the
     # guest needs to raise privileges: no sudo, and no setuid or
@@ -420,12 +466,13 @@ in
     ];
 
     systemd.services.claudevm-home = {
-      description = "Prepare agent home, broker access and shared directories from the launch share";
+      description = "Prepare agent home, broker access, the open-file limit, the store ACL, the store share's cover and shared directories from the launch share";
       requires = [ "nftables.service" ];
       after = [ "nftables.service" ];
       unitConfig.RequiresMountsFor = [ "/mnt/launch" ];
       onFailure = [ "poweroff.target" ];
-      path = [ pkgs.util-linux pkgs.nftables pkgs.jq ];
+      path = [ pkgs.util-linux pkgs.nftables pkgs.jq pkgs.acl ];
+      enableStrictShellChecks = true;
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
@@ -433,12 +480,45 @@ in
         StandardError = "journal+console";
       };
       script = ''
+        # shellcheck disable=SC1091
         . /mnt/launch/env
         : "''${CLAUDEVM_BROKER_PORT:?is not set in /mnt/launch/env}"
         : "''${CLAUDEVM_GUEST_KEY:?is not set in /mnt/launch/env}"
         : "''${CLAUDEVM_WORKSPACE:?is not set in /mnt/launch/env}"
+        ${shareBudget}
+        # Processes without CAP_SYS_ADMIN, everything the session runs among
+        # them, may hold a quarter of the share budget open. Root's files
+        # count towards fs.file-max too, but only root may exceed it. The
+        # files the kernel keeps open behind a mapping of a store file,
+        # working directories and the parents of everything held pin inodes
+        # on a share without counting. systemd raises fs.file-max to the
+        # largest value at boot.
+        file_max=$((share_fds / 4))
+        echo "$file_max" > /proc/sys/fs/file-max
         nft insert rule inet egress output \
           ip daddr 10.0.2.2 tcp dport "$CLAUDEVM_BROKER_PORT" accept
+        # The guest's /nix/store shows the host's whole store. Its ACL lets
+        # agent traverse it, so that every store path stays reachable by its
+        # name, but not list it. The same goes for /nix/store/.links, where
+        # a host that optimises its store keeps a link to every distinct
+        # file of it; the ACL copies up only the directory itself. /nix/store
+        # is a read-only bind mount for every process but the Nix daemon,
+        # which remounts it read-write in a mount namespace of its own; the
+        # ACLs are set the same way. The daemon's chmod of the store
+        # directory changes the ACL's mask and keeps the entry for agent.
+        unshare --mount -- ${pkgs.runtimeShell} -euc '
+          mount -o remount,bind,rw /nix/store
+          setfacl -m u:${agent.name}:x /nix/store
+          if [ -e /nix/store/.links ]; then
+            setfacl -m u:${agent.name}:x /nix/store/.links
+          fi
+        '
+        # /nix/.ro-store is the host's store itself, the lower layer of the
+        # /nix/store overlay. The overlay holds its own reference to it, so
+        # /nix/store keeps working under this empty root-only file system.
+        # systemd counts the cover as part of the mount unit of
+        # /nix/.ro-store, so only root stopping that unit removes it.
+        mount -t tmpfs -o ro,nosuid,nodev,noexec,mode=0700 tmpfs /nix/.ro-store
         install -d -o ${agent.name} -g ${agent.group} -m 0700 ${agent.home}/.claude
         install -o ${agent.name} -g ${agent.group} -m 0600 ${claudeSettings} ${agent.home}/.claude/settings.json
         install -o ${agent.name} -g ${agent.group} -m 0600 /dev/null ${agent.home}/.claude.json
@@ -457,6 +537,86 @@ in
           mkdir -p "$path"
           mount -t virtiofs -o "$mode" "$tag" "$path"
         done < /mnt/launch/mounts
+      '';
+    };
+
+    # Drops the guest's unused dentries and inodes once it holds more than
+    # half of the share budget in virtiofs inodes. The guest kernel keeps
+    # unused inodes cached until memory runs short, which a scan of a large
+    # tree does not cause; even a plain directory listing makes it look up
+    # the entries it reads, as virtiofs reads directories with readdirplus.
+    # A drop frees unused entries only, so it brings the count back below
+    # the threshold only while what the guest pins stays below it: open
+    # files, at most a quarter of the budget, plus the files kept open
+    # behind mappings of store files, working directories and their
+    # parents, which no limit bounds. In a booted guest a drop leaves about
+    # 600 descriptors held on the store share, far below the threshold.
+    #
+    # The fuse_inode line of /proc/slabinfo counts the inodes of all shares
+    # together, and its active objects include the free objects of per-CPU
+    # slabs, so the count errs high. The line always exists: the cache has
+    # a constructor, so the kernel never merges it into another. A write to
+    # drop_caches with bit 2 frees the unused overlay dentries and the
+    # virtiofs dentries and inodes they held, and a small residue can remain
+    # until the next write; bit 4 keeps the kernel from logging every write
+    # after the first.
+    #
+    # The check runs in one long-lived process that uses bash builtins only
+    # and so starts no program: starting one opens files on the store, which
+    # fails with ENFILE once the store's daemon has run out. For the same
+    # reason a failure powers the VM off at once, without the shutdown
+    # programs. It checks once a second and drops at every check above the
+    # threshold, and it logs a drop that follows a check below the threshold
+    # and the first check after a drop that is still above it.
+    systemd.services.claudevm-share-inodes = {
+      description = "Drop unused virtiofs inodes before a share runs out of host descriptors";
+      wantedBy = [ "multi-user.target" ];
+      before = [ "claude-session.service" ];
+      unitConfig = {
+        RequiresMountsFor = [ "/mnt/launch" ];
+        FailureAction = "poweroff-immediate";
+      };
+      enableStrictShellChecks = true;
+      serviceConfig = {
+        Type = "exec";
+        OOMScoreAdjust = -1000;
+        StandardError = "journal+console";
+      };
+      script = ''
+        enable -f ${pkgs.runtimeShellPackage}/lib/bash/sleep sleep
+        # shellcheck disable=SC1091
+        . /mnt/launch/env
+        ${shareBudget}
+        drop_above=$((share_fds / 2))
+        # The last check found the count below the threshold, dropped after
+        # a check below it, or found it still above it after a drop.
+        state=below
+        while true; do
+          inodes=
+          while read -r name active _; do
+            if [ "$name" = fuse_inode ]; then
+              inodes=$active
+              break
+            fi
+          done < /proc/slabinfo
+          : "''${inodes:?/proc/slabinfo has no fuse_inode line}"
+          if [ "$inodes" -le "$drop_above" ]; then
+            state=below
+          else
+            case $state in
+              below)
+                echo "$inodes virtiofs inodes exceed $drop_above; dropping the unused dentries and inodes"
+                state=dropped
+                ;;
+              dropped)
+                echo "$inodes virtiofs inodes still exceed $drop_above after a drop; dropping at every check until the count falls below"
+                state=held
+                ;;
+            esac
+            echo 6 > /proc/sys/vm/drop_caches
+          fi
+          sleep 1
+        done
       '';
     };
 
@@ -498,6 +658,10 @@ in
         # SIGTERM and this long to exit before SIGKILL. A unit whose
         # processes need the SIGKILL fails.
         TimeoutStopSec = 3;
+        # Every process of the session inherits both, so no program it runs
+        # gains privileges, setuid or file capabilities notwithstanding.
+        NoNewPrivileges = true;
+        CapabilityBoundingSet = "";
       };
     };
   };

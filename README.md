@@ -150,7 +150,7 @@ Host                            Guest
 $PWD                rw   --->   same path
 [[mounts]] dirs     ro   --->   same path             rw with writable = true
 plugin_mounts dirs  ro   --->   same path
-/nix/store          ro   --->   /nix/.ro-store        plus a writable overlay
+/nix/store          ro   --->   /nix/store            not listable; rw overlay
 token               brokered    the guest holds a per-session dummy key
 ~/.claude           not shared
 ~/.claude.json      not shared
@@ -201,13 +201,30 @@ everything else     not shared
   first nameserver in the host's `/etc/resolv.conf`, such as
   systemd-resolved on the host's loopback or a router on the LAN; and the
   broker's TCP port on 10.0.2.2, which the guest admits at boot.
+- Store: the guest's `/nix/store` shows the host's store read-only, with a
+  writable overlay in RAM for what the VM builds. The agent's own tools can
+  reach every store path by its name but cannot list `/nix/store` or
+  `/nix/store/.links`, and the share the overlay is built on is hidden.
+- Open files: each virtiofsd of a launch, and QEMU, may hold as many open
+  files as your hard limit (`ulimit -Hn`); a virtiofsd answers the guest
+  with ENFILE before it runs out itself. It holds one for every file and
+  directory of its share that the guest has cached and one more for every
+  one the guest has open. Processes in the VM may hold about a quarter of
+  that many files open; root's files count too, and only root may exceed
+  it. Once the guest has cached more than half of it, it drops within a
+  second the entries nothing uses; files kept open behind mappings,
+  working directories and their parent directories stay, which in ordinary
+  use are far fewer. A share that runs out before the drop answers opens,
+  and lookups of paths the guest has not cached, with ENFILE, so exec and
+  stat of such paths fail too until then.
 - Nix: flakes are enabled; `nix develop` and `nix build` work inside.
-- Hardening: the guest has no nested virtualization, no user namespaces, no
-  io_uring and no setuid or file-capability programs, `sudo` included. Its
-  kernel loads no line discipline on demand and none of the blacklisted
-  modules of unused devices, socket families and netlink protocols. Claude
-  Code's own sandbox mode and other tools built on bubblewrap therefore do
-  not work in the VM; `nix build` does.
+- Hardening: the guest has no nested virtualization or KVM, no user
+  namespaces, no io_uring and no setuid or file-capability programs, `sudo`
+  included, and nothing the session runs can gain privileges. Only root can
+  open `/dev/fuse`. Its kernel loads no line discipline on demand and none
+  of the blacklisted modules of unused devices, socket families and netlink
+  protocols. Claude Code's own sandbox mode and other tools built on
+  bubblewrap therefore do not work in the VM; `nix build` does.
 - Git: `claudevm` warns at launch if `.git` is a file (linked worktrees,
   submodules); git will not work inside the VM then. After the session it
   prints a NOTICE if `.git`, `.git/config` or `.git/hooks` changed.
@@ -223,8 +240,14 @@ everything else     not shared
 - A launch with `forward_packages` builds whatever the named flakes define,
   including a workspace flake the agent may have edited: the same trust as
   running `nix build` in that repository yourself.
-- The internet is open, so anything readable inside the VM, including the
-  entire host nix store, can in principle be sent out.
+- The internet is open, so anything readable inside the VM can in principle
+  be sent out, including any host store path the agent can name.
+- A garbage collection, which any user in the VM can start, makes the Nix
+  daemon walk the whole host store as root, with only the dropping of
+  unused entries keeping the store share from running out, and delete
+  through the overlay every path that the guest's database does not
+  register. That hides every host-only store path from the VM for the rest
+  of the session, and `nix-store --gc --print-dead` reports their names.
 - A host service listening on a public IPv4 address of the host is
   reachable: the guest firewall tells destinations apart by address range
   and cannot tell the host's public address from the rest of the internet.
@@ -243,6 +266,7 @@ everything else     not shared
 
 - x86_64 Linux host with Nix and flakes enabled.
 - `/dev/kvm` writable by you. There is no software-emulation fallback.
+- A hard limit of open files (`ulimit -Hn`) of at least 65536.
 - Unprivileged user namespaces for virtiofsd's sandbox (Ubuntu 24.04's
   AppArmor policy blocks them by default).
 - A token stored with `claudevm login`. `claude setup-token`, which makes

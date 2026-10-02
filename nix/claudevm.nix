@@ -445,6 +445,35 @@ writeShellApplication {
       exit 1
     fi
 
+    # virtiofsd holds a host descriptor for every inode of its share that
+    # the guest holds and another for every file the guest has open. QEMU's
+    # user networking holds a host socket for every guest connection, every
+    # ICMP echo request and every guest UDP source port, the last two for up
+    # to 240 s each; the guest's fs.file-max does not bound these, and once
+    # QEMU has spent its limit, new guest connections fail until old ones
+    # expire. Each virtiofsd gets the hard limit of open files as
+    # --rlimit-nofile and QEMU as its soft limit, raised in the subshell
+    # that starts it. The broker and everything else the launcher runs keep
+    # the soft limit claudevm starts with, which bounds the broker's
+    # connections. Each virtiofsd runs a thread per host CPU, keeps
+    # claudevm.virtiofsdReservedFds descriptors and one per thread for
+    # itself and answers the guest with ENFILE once the guest holds the
+    # rest, share_fds, which the guest reads from the launch input "env". A
+    # booted guest holds about 2500 descriptors on the store share; the VM
+    # requires a hard limit of at least 65536 so that this stays a small
+    # part of share_fds.
+    share_nofile=$(ulimit -Hn)
+    if ! [[ $share_nofile =~ ^[1-9][0-9]*$ ]]; then
+      echo "claudevm: the hard limit of open files is '$share_nofile', not a number" >&2
+      exit 1
+    fi
+    if [ "$share_nofile" -lt 65536 ]; then
+      echo "claudevm: the hard limit of open files (ulimit -Hn) is $share_nofile; the VM requires at least 65536" >&2
+      exit 1
+    fi
+    share_threads=$host_vcpu
+    share_fds=$((share_nofile - ${toString guest.claudevm.virtiofsdReservedFds} - share_threads))
+
     runtime=$(mktemp -d "''${XDG_RUNTIME_DIR:-/tmp}/claudevm.XXXXXXXX")
     qemu_pid=
     virtiofsd_pid=
@@ -598,6 +627,7 @@ writeShellApplication {
       printf 'CLAUDEVM_WORKSPACE=%q\n' "$workspace"
       printf 'CLAUDEVM_BROKER_PORT=%q\n' "$broker_port"
       printf 'CLAUDEVM_GUEST_KEY=%q\n' "$guest_key"
+      printf 'CLAUDEVM_SHARE_FDS=%q\n' "$share_fds"
     } > "$runtime/launch/env"
 
     for arg in "$@"; do printf '%s\0' "$arg"; done > "$runtime/launch/claude-args"
@@ -624,7 +654,8 @@ writeShellApplication {
     # Share sources and socket paths are relative to the runtime directory.
     cd "$runtime"
 
-    ${runner}/bin/virtiofsd-run > virtiofsd.log 2>&1 &
+    CLAUDEVM_SHARE_NOFILE=$share_nofile CLAUDEVM_SHARE_THREADS=$share_threads \
+      ${runner}/bin/virtiofsd-run > virtiofsd.log 2>&1 &
     virtiofsd_pid=$!
 
     # qemu connects to every vhost-user socket at startup and fails if one
@@ -644,7 +675,10 @@ writeShellApplication {
     # A non-interactive shell points the stdin of a background job at
     # /dev/null; <&0 keeps the terminal. The QEMU argument script of the
     # runner reads the size of the VM from CLAUDEVM_VCPU and CLAUDEVM_MEM.
-    CLAUDEVM_VCPU=$vcpu CLAUDEVM_MEM=$memory ${runner}/bin/microvm-run <&0 &
+    (
+      ulimit -Sn "$share_nofile" &&
+        CLAUDEVM_VCPU=$vcpu CLAUDEVM_MEM=$memory exec ${runner}/bin/microvm-run
+    ) <&0 &
     qemu_pid=$!
 
     finished=
