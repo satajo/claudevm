@@ -524,6 +524,7 @@ writeShellApplication {
     # runtime directory is a GC root that keeps the build for the session;
     # nix names it fwd<entry>, plus -<output> for an output other than out.
     forward_installables=()
+    forward_outputs=()
     forward_dirs=()
     for i in "''${!forward_packages[@]}"; do
       entry="forward_packages entry $((i + 1))"
@@ -540,6 +541,7 @@ writeShellApplication {
           /nix/store/*) ;;
           *) config_error "$entry: '$installable' built $out_path, which lies outside /nix/store, the only store the VM sees" ;;
         esac
+        forward_outputs+=("$out_path")
         if [ -d "$out_path/bin" ]; then
           bin_dirs+=("$out_path/bin")
         fi
@@ -644,6 +646,22 @@ writeShellApplication {
     # Bin directories of the forward_packages, read by the guest, which puts
     # them first on PATH in this order.
     for dir in "''${forward_dirs[@]}"; do printf '%s\0' "$dir"; done > "$runtime/launch/forward-path"
+
+    # Store paths of the forward_packages outputs, each once, which the
+    # guest makes garbage collection roots.
+    for out_path in "''${forward_outputs[@]}"; do printf '%s\0' "$out_path"; done \
+      | LC_ALL=C sort -zu > "$runtime/launch/forward-outputs"
+
+    # Nix validity registration of the closure of those outputs, which the
+    # guest loads into its Nix database; empty without outputs, for which
+    # nix-store --query prints nothing. nix-store --dump-db without paths
+    # dumps the host's whole database, so xargs -r runs it only when there
+    # are paths.
+    if ! nix-store --query --requisites "''${forward_outputs[@]}" \
+        | xargs -r -d '\n' nix-store --dump-db > "$runtime/launch/forward-registration"; then
+      echo "claudevm: cannot read the nix registration of the forward_packages closure" >&2
+      exit 1
+    fi
 
     # Paths of the plugin_mounts directories, which the guest sees at their
     # host paths and loads into Claude Code in this order.

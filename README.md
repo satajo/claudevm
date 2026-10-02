@@ -118,8 +118,10 @@ writable = false  # default false: read-only
 - Every `bin` directory among the outputs `nix build` produces for an entry
   goes on the agent's PATH, ahead of the rest of PATH and in the order
   listed; an entry without one is an error. The VM reads them through its
-  share of the host nix store and downloads nothing. The built paths are
-  kept from garbage collection until the session ends.
+  share of the host nix store and downloads nothing. The built outputs and
+  everything they reference are valid to the Nix in the VM, and garbage
+  collection keeps them, in the VM and on the host, until the session
+  ends.
 - `plugin_mounts` lists host plugin directories for the session's Claude
   Code. Each entry is a path written like a mount path, absolute or starting
   with `~/`, and names a directory that contains
@@ -200,7 +202,12 @@ everything else     not shared
   to QEMU at 10.0.2.2; DNS through 10.0.2.3, which QEMU forwards to the
   first nameserver in the host's `/etc/resolv.conf`, such as
   systemd-resolved on the host's loopback or a router on the LAN; and the
-  broker's TCP port on 10.0.2.2, which the guest admits at boot.
+  broker's TCP port on 10.0.2.2, which the guest admits at boot. In the
+  guest, systemd-resolved sends every lookup to 10.0.2.3 and to no other
+  server, and runs no LLMNR or multicast DNS, so nothing in the guest
+  listens for name queries from the network. The guest contacts no time
+  server: its clock is kvm-clock, which takes the time from the host and
+  keeps in step with it.
 - Store: the guest's `/nix/store` shows the host's store read-only, with a
   writable overlay in RAM for what the VM builds. The agent's own tools can
   reach every store path by its name but cannot list `/nix/store` or
@@ -217,6 +224,16 @@ everything else     not shared
   use are far fewer. A share that runs out before the drop answers opens,
   and lookups of paths the guest has not cached, with ENFILE, so exec and
   stat of such paths fail too until then.
+- Memory: the session and the Nix daemon, with the builds it runs for the
+  session, may together hold the guest's RAM less a fixed reserve of 256
+  MiB, files they write to the VM's RAM-backed file systems included; the
+  guest has no swap. The reserve holds the kernel's own memory, PID 1, the
+  journal, which keeps at most 16 MiB, and the guest's other services, and
+  is the same at every `memory`. The guest's RAM is what its kernel
+  reports, somewhat less than `memory`: 3917 MiB at 4096. When the session
+  and the daemon reach their limit, the kernel kills the one process among
+  them that holds the most memory, and the session goes on as long as
+  Claude Code or the debug shell itself runs.
 - Nix: flakes are enabled; `nix develop` and `nix build` work inside.
 - Hardening: the guest has no nested virtualization or KVM, no user
   namespaces, no io_uring and no setuid or file-capability programs, `sudo`
@@ -224,7 +241,10 @@ everything else     not shared
   open `/dev/fuse`. Its kernel loads no line discipline on demand and none
   of the blacklisted modules of unused devices, socket families and netlink
   protocols. Claude Code's own sandbox mode and other tools built on
-  bubblewrap therefore do not work in the VM; `nix build` does.
+  bubblewrap therefore do not work in the VM; `nix build` does. No process
+  in the VM leaves a core dump: the kernel hands every dump to a program
+  that discards it, so none fills the VM's RAM or lands in a shared
+  directory.
 - Git: `claudevm` warns at launch if `.git` is a file (linked worktrees,
   submodules); git will not work inside the VM then. After the session it
   prints a NOTICE if `.git`, `.git/config` or `.git/hooks` changed.
@@ -246,8 +266,11 @@ everything else     not shared
   daemon walk the whole host store as root, with only the dropping of
   unused entries keeping the store share from running out, and delete
   through the overlay every path that the guest's database does not
-  register. That hides every host-only store path from the VM for the rest
-  of the session, and `nix-store --gc --print-dead` reports their names.
+  register or that no garbage collection root keeps. The `forward_packages`
+  outputs and their closure are registered and rooted, so a collection
+  keeps them; it hides every other host-only store path from the VM for
+  the rest of the session, and `nix-store --gc --print-dead` reports their
+  names.
 - A host service listening on a public IPv4 address of the host is
   reachable: the guest firewall tells destinations apart by address range
   and cannot tell the host's public address from the rest of the internet.
@@ -258,6 +281,10 @@ everything else     not shared
   the session lasts, and so use your account; it cannot read the token.
 - The workspace and writable mounts can grow until the host filesystem they
   live on is full, so a runaway process in the VM can fill the host disk.
+- When the session runs out of memory, the process the kernel kills is the
+  one that holds the most, which can be Claude Code itself, for example
+  when files in the VM's RAM rather than a process hold the memory; the
+  session then ends.
 - Shared directories are shared as they are, so a symlink inside one
   resolves inside the VM, not on the host: it reaches a host file only when
   that file lies in a shared directory too.

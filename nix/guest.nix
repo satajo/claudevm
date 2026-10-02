@@ -5,6 +5,17 @@ let
   agent = config.users.users.agent;
   agentGid = config.users.groups.${agent.group}.gid;
 
+  # The journal lives in RAM, outside agent.slice, and keeps at most this
+  # many MiB.
+  journalMaxMiB = 16;
+
+  # The guest's RAM that agent.slice leaves to the rest of the guest, the
+  # same at every launch size. At idle the kernel, PID 1 and the guest's
+  # services hold about 100 MiB that they cannot reclaim, about half of it
+  # kernel memory charged to no cgroup. The journal may add journalMaxMiB,
+  # and the rest is headroom for their page cache and growth.
+  memoryReserveMiB = 256;
+
   # The shares every launch has. Relative share sources resolve against the
   # runtime directory the claudevm wrapper cds into before starting
   # virtiofsd, where "launch" is a plain directory of per-invocation launch
@@ -343,6 +354,27 @@ in
       };
     };
 
+    # The guest resolves names through systemd-resolved on 127.0.0.53,
+    # which asks the DNS server that DHCP names, slirp's 10.0.2.3, and no
+    # other: without fallback servers it never turns to its built-in public
+    # ones, such as 1.1.1.1, which it does while no link has a DNS server,
+    # as early in boot. It runs no LLMNR or multicast DNS, so it neither
+    # listens for name queries on the link nor sends any there.
+    services.resolved = {
+      enable = true;
+      settings.Resolve = {
+        FallbackDNS = [ ];
+        LLMNR = false;
+        MulticastDNS = false;
+      };
+    };
+
+    # systemd-timesyncd would contact the NixOS NTP pool on its own. The
+    # guest's clock source is kvm-clock, which takes the time from the host
+    # at boot and keeps in step with the host's clock, and on which the TLS
+    # certificate checks in the guest depend.
+    services.timesyncd.enable = false;
+
     # Of everything outside the guest, only the internet over IPv4 is
     # reachable, with three exceptions: DHCP to slirp at 10.0.2.2; DNS
     # through 10.0.2.3, which slirp forwards to the first nameserver of the
@@ -409,7 +441,18 @@ in
       "l2tp_netlink" "ovpn" "cfg80211"
     ];
 
+    # No process in the guest leaves a core dump. Without systemd-coredump,
+    # none is stored under /var/lib/systemd/coredump on the RAM-backed root.
+    systemd.coredump.enable = false;
+
     boot.kernel.sysctl = {
+      # The kernel pipes every core dump to false, which exits without
+      # reading it, so no core file appears in the working directory of the
+      # crashing process either, which may be the workspace or another share
+      # on the host. A pipe ignores RLIMIT_CORE, which the session's
+      # processes start with unlimited, soft and hard, so this holds for
+      # every process.
+      "kernel.core_pattern" = "|${lib.getExe' pkgs.coreutils "false"}";
       # Refuses io_uring_setup to every process, root included.
       "kernel.io_uring_disabled" = 2;
       # TIOCSETD on any terminal, a pty included, would otherwise load the
@@ -466,7 +509,7 @@ in
     ];
 
     systemd.services.claudevm-home = {
-      description = "Prepare agent home, broker access, the open-file limit, the store ACL, the store share's cover and shared directories from the launch share";
+      description = "Prepare agent home, broker access, the open-file limit, the store ACL, the forward_packages registration, the agent memory limit, the store share's cover and shared directories from the launch share";
       requires = [ "nftables.service" ];
       after = [ "nftables.service" ];
       unitConfig.RequiresMountsFor = [ "/mnt/launch" ];
@@ -502,10 +545,11 @@ in
         # name, but not list it. The same goes for /nix/store/.links, where
         # a host that optimises its store keeps a link to every distinct
         # file of it; the ACL copies up only the directory itself. /nix/store
-        # is a read-only bind mount for every process but the Nix daemon,
-        # which remounts it read-write in a mount namespace of its own; the
-        # ACLs are set the same way. The daemon's chmod of the store
-        # directory changes the ACL's mask and keeps the entry for agent.
+        # is a read-only bind mount for every process but the Nix processes
+        # of root, the daemon among them, each of which remounts it
+        # read-write in a mount namespace of its own; the ACLs are set the
+        # same way. Their chmod of the store directory changes the ACL's
+        # mask and keeps the entry for agent.
         unshare --mount -- ${pkgs.runtimeShell} -euc '
           mount -o remount,bind,rw /nix/store
           setfacl -m u:${agent.name}:x /nix/store
@@ -513,6 +557,35 @@ in
             setfacl -m u:${agent.name}:x /nix/store/.links
           fi
         '
+        # The launch input "forward-registration" is the Nix validity
+        # registration, as nix-store --dump-db writes it, of the closure of
+        # the forward_packages outputs, and "forward-outputs" lists those
+        # outputs as NUL-terminated store paths, each once; both are empty
+        # without forward_packages. A garbage collection, which every user
+        # may ask the Nix daemon for, removes from the /nix/store overlay
+        # every path that is not valid in the guest's Nix database or not
+        # reachable from a garbage collection root. The database starts with
+        # the system closure; the registration adds the closure of the
+        # outputs, and the links under /nix/var/nix/gcroots root the
+        # outputs. Root's nix-store opens the database itself, without the
+        # daemon.
+        ${config.nix.package.out}/bin/nix-store --load-db < /mnt/launch/forward-registration
+        mkdir /nix/var/nix/gcroots/forward-packages
+        xargs -0 -r ln -s -t /nix/var/nix/gcroots/forward-packages < /mnt/launch/forward-outputs
+        # agent.slice may hold the guest's RAM less memoryReserveMiB.
+        memtotal_kib=
+        while read -r key value _; do
+          if [ "$key" = MemTotal: ]; then
+            memtotal_kib=$value
+          fi
+        done < /proc/meminfo
+        : "''${memtotal_kib:?/proc/meminfo has no MemTotal}"
+        agent_kib=$((memtotal_kib - ${toString (memoryReserveMiB * 1024)}))
+        if [ "$agent_kib" -le 0 ]; then
+          echo "the guest's RAM of $memtotal_kib KiB leaves nothing beyond the reserve of ${toString memoryReserveMiB} MiB" >&2
+          exit 1
+        fi
+        systemctl set-property --runtime agent.slice MemoryMax=$((agent_kib * 1024))
         # /nix/.ro-store is the host's store itself, the lower layer of the
         # /nix/store overlay. The overlay holds its own reference to it, so
         # /nix/store keeps working under this empty root-only file system.
@@ -620,6 +693,34 @@ in
       '';
     };
 
+    # The session and the Nix daemon, in whose cgroup the builds the session
+    # asks for run, share one memory budget: together they hold no more
+    # than MemoryMax, and either may use all of it. Files that their
+    # processes write to the guest's RAM-backed file systems count against
+    # it too. claudevm-home sets MemoryMax at boot to the guest's RAM less
+    # memoryReserveMiB, before either unit starts. The guest has no swap,
+    # so once the slice reaches MemoryMax the kernel can reclaim only its
+    # page cache and then kills the process of the slice that holds the
+    # most memory.
+    systemd.slices.agent.description = "Claude Code session and Nix daemon";
+
+    systemd.services.nix-daemon = {
+      after = [ "claudevm-home.service" ];
+      serviceConfig = {
+        Slice = "agent.slice";
+        # A build that the kernel kills for lack of memory fails alone; the
+        # daemon goes on serving.
+        OOMPolicy = "continue";
+      };
+    };
+
+    # The journal is RAM outside agent.slice, which the session can fill
+    # through logger and systemd-cat.
+    services.journald.settings.Journal = {
+      Storage = "volatile";
+      RuntimeMaxUse = "${toString journalMaxMiB}M";
+    };
+
     systemd.services.claude-session = {
       description = "Claude Code session on the VM console";
       requires = [ "claudevm-home.service" ];
@@ -658,6 +759,12 @@ in
         # SIGTERM and this long to exit before SIGKILL. A unit whose
         # processes need the SIGKILL fails.
         TimeoutStopSec = 3;
+        Slice = "agent.slice";
+        # systemd's default OOM policy, stop, ends a unit once the kernel
+        # has killed any of its processes for lack of memory. continue
+        # keeps the session, and with it the VM, running for as long as its
+        # main process lives.
+        OOMPolicy = "continue";
         # Every process of the session inherits both, so no program it runs
         # gains privileges, setuid or file capabilities notwithstanding.
         NoNewPrivileges = true;
