@@ -465,7 +465,19 @@ in
       requires = [ "claudevm-home.service" ];
       wants = [ "network-online.target" ];
       after = [ "claudevm-home.service" "network-online.target" ];
-      unitConfig.RequiresMountsFor = [ "/mnt/launch" ];
+      unitConfig = {
+        RequiresMountsFor = [ "/mnt/launch" ];
+        # The end of the session is the end of the VM. Once the unit is
+        # inactive or failed, PID 1 syncs and powers off with the reboot
+        # system call without stopping any other unit, so nothing else
+        # running in the guest delays it; for a failed unit it waits 5 s
+        # first. Nothing in the guest needs an orderly shutdown: the root
+        # file system lives in RAM, and virtiofsd-run serves the shares
+        # without writeback caching, so a write to a shared directory has
+        # reached the host when the write call returns.
+        SuccessAction = "poweroff-immediate";
+        FailureAction = "poweroff-immediate";
+      };
       wantedBy = [ "multi-user.target" ];
       path = [ "/run/current-system/sw" ];
       serviceConfig = {
@@ -478,8 +490,14 @@ in
         TTYPath = "/dev/ttyS0";
         TTYReset = true;
         TTYVHangup = true;
-        ExecStart = lib.getExe claudeSession;
-        ExecStopPost = "+${config.systemd.package}/bin/systemctl poweroff";
+        # "-" makes every end of the session a success, a non-zero exit
+        # status or a fatal signal alike, which spares it the 5 s wait of
+        # FailureAction.
+        ExecStart = "-${lib.getExe claudeSession}";
+        # When the session exits, the processes it leaves running get
+        # SIGTERM and this long to exit before SIGKILL. A unit whose
+        # processes need the SIGKILL fails.
+        TimeoutStopSec = 3;
       };
     };
   };

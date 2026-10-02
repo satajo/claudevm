@@ -30,8 +30,12 @@ packages. The commands are then `claudevm`, `claudevm init`,
 
 Boot waits for the guest network and takes about ten seconds. When Claude
 Code exits, the VM powers off and `claudevm` cleans up; a failed guest mount
-also powers it off. SIGINT, SIGHUP or SIGTERM stops QEMU, virtiofsd and the
-broker.
+also powers it off. Processes that Claude Code leaves running get SIGTERM
+and three seconds to exit; any still running then are killed, and the VM
+powers off five seconds later. Nothing else in the VM delays the power-off,
+and every write a process in the VM completed has reached the host before
+it; a file that a killed process was still writing stays as far as it got.
+SIGINT, SIGHUP or SIGTERM stops QEMU, virtiofsd and the broker.
 
 - `claudevm shell` gives a debug shell instead of Claude Code, and takes no
   arguments. `claude` works in it with the same API access as the session.
