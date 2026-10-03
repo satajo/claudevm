@@ -97,8 +97,9 @@ writable = false  # default false: read-only
   with 2047 MiB, because QEMU's microvm machine hangs at boot with exactly
   2 GiB.
 - A mount appears in the guest at its host path with symlinks resolved.
-  Read-only mounts are enforced by virtiofsd on the host. Files written to a
-  writable mount are owned by you on the host.
+  Read-only mounts are enforced by virtiofsd on the host and mounted
+  read-only in the guest. Files written to a writable mount are owned by
+  you on the host.
 - `claudevm` refuses a mount path that does not exist, is not a directory,
   is or contains `$HOME` (directories under it are fine), contains
   `~/.claude`, `~/.claude.json`, the token file or its directory, lies
@@ -138,7 +139,8 @@ writable = false  # default false: read-only
   `.claude-plugin/plugin.json`. It does so only in a trusted workspace, and
   the image's defaults trust the workspace.
 - `claudevm.toml` lives in the workspace, so it is visible and editable
-  inside the VM by design. Every launch prints the effective configuration
+  inside the VM by design; after a session that changed it, `claudevm`
+  prints a NOTICE. Every launch prints the effective configuration
   after the builds and before the VM starts: the workspace, each mount with
   `ro` or `rw`, one `plugin` line per `plugin_mounts` entry, with `ro` when
   the entry has a share of its own, each `forward_packages` entry, vcpu,
@@ -212,6 +214,8 @@ everything else     not shared
   writable overlay in RAM for what the VM builds. The agent's own tools can
   reach every store path by its name but cannot list `/nix/store` or
   `/nix/store/.links`, and the share the overlay is built on is hidden.
+  That share and the VM's launch input at `/mnt/launch` are enforced
+  read-only by virtiofsd on the host and mounted read-only in the guest.
 - Open files: each virtiofsd of a launch, and QEMU, may hold as many open
   files as your hard limit (`ulimit -Hn`); a virtiofsd answers the guest
   with ENFILE before it runs out itself. It holds one for every file and
@@ -238,16 +242,26 @@ everything else     not shared
 - Hardening: the guest has no nested virtualization or KVM, no user
   namespaces, no io_uring and no setuid or file-capability programs, `sudo`
   included, and nothing the session runs can gain privileges. Only root can
-  open `/dev/fuse`. Its kernel loads no line discipline on demand and none
-  of the blacklisted modules of unused devices, socket families and netlink
-  protocols. Claude Code's own sandbox mode and other tools built on
-  bubblewrap therefore do not work in the VM; `nix build` does. No process
-  in the VM leaves a core dump: the kernel hands every dump to a program
-  that discards it, so none fills the VM's RAM or lands in a shared
-  directory.
+  open `/dev/fuse` and the device nodes of the blacklisted vhost, vsock,
+  VFIO and tun modules, which would stay out of the session's reach even
+  with their module loaded. The guest's kernel loads no line discipline on
+  demand and none of the blacklisted modules of unused devices, socket
+  families and netlink protocols. Claude Code's own sandbox mode and other
+  tools built on bubblewrap therefore do not work in the VM; `nix build`
+  does. No process in the VM leaves a core dump: the kernel hands every
+  dump to a program that discards it, so none fills the VM's RAM or lands
+  in a shared directory.
 - Git: `claudevm` warns at launch if `.git` is a file (linked worktrees,
   submodules); git will not work inside the VM then. After the session it
   prints a NOTICE if `.git`, `.git/config` or `.git/hooks` changed.
+- Configuration: after the session `claudevm` prints a NOTICE if
+  `claudevm.toml` changed in any way since the launch read it: its content,
+  its mode or the entry itself, for example replaced with a symlink or
+  removed. The next launch reads it to decide which host directories the
+  VM shares and which packages the host builds, so review the change
+  before launching again; the NOTICE does not stop that launch. It covers
+  `claudevm.toml` itself, not the content of a workspace flake that a
+  relative `forward_packages` entry builds.
 
 ## What the sandbox does not protect
 
@@ -260,6 +274,9 @@ everything else     not shared
 - A launch with `forward_packages` builds whatever the named flakes define,
   including a workspace flake the agent may have edited: the same trust as
   running `nix build` in that repository yourself.
+- The agent can edit `claudevm.toml`, and the next launch shares the host
+  directories and builds the packages the file then names. The NOTICE
+  reports the change; it does not prevent it.
 - The internet is open, so anything readable inside the VM can in principle
   be sent out, including any host store path the agent can name.
 - A garbage collection, which any user in the VM can start, makes the Nix

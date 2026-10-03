@@ -239,6 +239,17 @@ writeShellApplication {
       } | sort | sha256sum
     }
 
+    # Digest of claudevm.toml: the entry itself and the content that the
+    # launcher reads from it, the target's when it is a symlink.
+    config_fingerprint() {
+      local config=$workspace/claudevm.toml
+      {
+        if [ -e "$config" ] || [ -L "$config" ]; then
+          find "$config" -maxdepth 0 -printf '%p %y %m %l\n' -xtype f -exec sha256sum {} +
+        fi
+      } | sort | sha256sum
+    }
+
     if [ ! -e claudevm.toml ]; then
       echo "claudevm: no claudevm.toml in $PWD; run 'claudevm init' to create one" >&2
       exit 1
@@ -325,6 +336,9 @@ writeShellApplication {
 
     add_share workspace "$workspace" rw "$workspace as workspace" "the workspace $workspace"
 
+    # The digest of claudevm.toml as this launch reads it, which the NOTICE
+    # at exit compares against.
+    config_before=$(config_fingerprint) || config_before=unreadable
     if ! config_json=$(toml2json claudevm.toml); then
       echo "claudevm: claudevm.toml is not valid TOML" >&2
       exit 1
@@ -482,7 +496,7 @@ writeShellApplication {
     saved_stty=$(stty -g 2>/dev/null || true)
 
     cleanup() {
-      local status=$? git_after log
+      local status=$? git_after config_after log
       if [ -n "$saved_stty" ]; then
         stty "$saved_stty" 2>/dev/null || true
       fi
@@ -510,6 +524,10 @@ writeShellApplication {
           echo "claudevm: NOTICE: $workspace/.git, its config or its hooks changed during the session." >&2
           echo "claudevm: NOTICE: git runs commands configured there; review them before running git on the host." >&2
         fi
+      fi
+      if ! config_after=$(config_fingerprint) || [ "$config_after" != "$config_before" ]; then
+        echo "claudevm: NOTICE: $workspace/claudevm.toml changed since this launch read it." >&2
+        echo "claudevm: NOTICE: the next launch reads it to decide which host directories the VM shares and which packages the host builds; review it before launching again." >&2
       fi
       rm -rf "$runtime"
     }

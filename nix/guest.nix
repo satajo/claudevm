@@ -322,6 +322,15 @@ in
         wait -n
       '';
 
+    # The host enforces a read-only share with virtiofsd --readonly, and the
+    # guest mounts it read-only as well, so a write fails with EROFS in the
+    # guest even if the host did not refuse it. "ro" follows the options
+    # that microvm.nix gives the mount, its "defaults" among them, as the
+    # last of conflicting mount options wins.
+    fileSystems = lib.listToAttrs (map
+      (share: lib.nameValuePair share.mountPoint { options = lib.mkAfter [ "ro" ]; })
+      (builtins.filter (share: share.readOnly) config.microvm.shares));
+
     # quiet also silences systemd's unit status lines. Log level 3 keeps
     # kernel messages less severe than critical off the console, among them
     # the harmless "PCI: Fatal: No config space access function found" of the
@@ -465,13 +474,36 @@ in
       "user.max_user_namespaces" = 0;
     };
 
-    # The process that opens /dev/fuse can serve a FUSE file system, which
-    # only root can mount: the guest has no setuid fusermount and no user
-    # namespaces. The fuse module itself stays loaded, as virtiofs is built
-    # on it.
-    services.udev.extraRules = ''
-      SUBSYSTEM=="misc", KERNEL=="fuse", MODE="0600"
-    '';
+    # Only root can open these device nodes, listed by kernel name with
+    # their static node's path under /dev, or null for a node that exists
+    # only while its module is loaded. The process that opens /dev/fuse can
+    # serve a FUSE file system, which only root can mount: the guest has no
+    # setuid fusermount and no user namespaces; the fuse module stays
+    # loaded, as virtiofs is built on it. The modules behind the other nodes
+    # are blacklisted, and with mode 0600 a loaded one would still be out of
+    # the agent's reach. The kernel package ships them, so /dev/net/tun,
+    # /dev/vfio/vfio, /dev/vhost-net and /dev/vhost-vsock exist as static
+    # nodes, which answer an open with ENODEV; vsock takes a dynamic minor,
+    # so /dev/vsock appears only once its module loads. systemd's default
+    # udev rules give all six nodes mode 0666, and its tmpfiles
+    # configuration gives the static ones the same at boot. A rule applies
+    # on the device event of its node, and no device event fires for the
+    # node of a module that is not loaded, so each static node is also
+    # named with static_node: udevd applies such rules at startup, after
+    # tmpfiles has run, in file order. NixOS installs these rules as
+    # 99-local.rules, after systemd's 50-udev-default.rules.
+    services.udev.extraRules = lib.concatStrings (lib.mapAttrsToList
+      (kernel: node: ''
+        SUBSYSTEM=="misc", KERNEL=="${kernel}", MODE="0600"${lib.optionalString (node != null) '', OPTIONS+="static_node=${node}"''}
+      '')
+      {
+        fuse = "fuse";
+        tun = "net/tun";
+        vfio = "vfio/vfio";
+        vhost-net = "vhost-net";
+        vhost-vsock = "vhost-vsock";
+        vsock = null;
+      });
 
     # Root is locked and the session starts as agent, so no program in the
     # guest needs to raise privileges: no sudo, and no setuid or
@@ -604,8 +636,9 @@ in
         # created before the mounts, since the mount loop creates the missing
         # parents of a share's path owned by root.
         install -d -o ${agent.name} -g ${agent.group} -m 0700 /tmp/claude-${toString agent.uid}
-        # The host enforces ro with virtiofsd --readonly; the ro mount
-        # option makes the guest report it up front.
+        # The host enforces a read-only share with virtiofsd --readonly, and
+        # the guest mounts it read-only as well, so a write fails with EROFS
+        # in the guest even if the host did not refuse it.
         while ${readMount}; do
           mkdir -p "$path"
           mount -t virtiofs -o "$mode" "$tag" "$path"
