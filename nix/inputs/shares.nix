@@ -2,8 +2,10 @@
 # the [[mounts]] directories and the directories later inputs add with
 # add_share. Each is served by a virtiofsd of its own.
 #
-# Uses from the launcher: workspace, HOME, config_dir, token_file,
-# mount_fields, contains, overlaps, refuse and resolve_entry_dir.
+# Uses from the launcher: workspace, HOME, claudevm_home, token_file,
+# mount_fields, contains, overlaps, refuse and resolve_entry_dir. Uses
+# from transcripts, in add_share: session_dir, which the launcher sets
+# empty and transcripts sets before it calls add_share.
 # Defines for later collect fragments: add_share and in_shared_dir.
 # Defines for the launcher after write: share_sockets.
 #
@@ -71,7 +73,7 @@ in
     # Nothing the VM can read or write may contain these.
     protected=(
       "$(realpath -e "$HOME")"
-      "$(realpath -e "$config_dir")"
+      "$claudevm_home"
       "$(realpath -e "$token_file")"
     )
     # A dangling symlink counts too, since claude on the host creates its
@@ -107,6 +109,11 @@ in
       done
       if [ -n "$claude_dir" ] && contains "$claude_dir" "$path"; then
         refuse "$subject" "it lies inside $claude_dir"
+      fi
+      # The session directory of this launch is the one directory inside
+      # the claudevm directory that the VM may see.
+      if contains "$claudevm_home" "$path" && [ "$path" != "$session_dir" ]; then
+        refuse "$subject" "it lies inside $claudevm_home"
       fi
       for guest_path in ${lib.escapeShellArgs guestPaths}; do
         if overlaps "$guest_path" "$path"; then

@@ -89,14 +89,24 @@ writeShellApplication {
     EOF
     }
 
-    # A relative XDG_CONFIG_HOME is invalid and leaves the default in place.
-    case ''${XDG_CONFIG_HOME-} in
-      /*) config_dir=$XDG_CONFIG_HOME/claudevm ;;
-      *) config_dir=$HOME/.config/claudevm ;;
-    esac
+    # The claudevm directory, which holds the token and the sessions
+    # directory: CLAUDEVM_HOME, or ~/claudevm when it is not set, with
+    # symlinks resolved.
+    if [ -v CLAUDEVM_HOME ]; then
+      case $CLAUDEVM_HOME in
+        /*) ;;
+        *)
+          echo "claudevm: CLAUDEVM_HOME is '$CLAUDEVM_HOME', which is not an absolute path" >&2
+          exit 1
+          ;;
+      esac
+      claudevm_home=$(realpath -m "$CLAUDEVM_HOME")
+    else
+      claudevm_home=$(realpath -m "$HOME/claudevm")
+    fi
     # The long-lived OAuth token of the user. Only the broker on the host
     # reads it; the VM never sees it.
-    token_file=$config_dir/token
+    token_file=$claudevm_home/token
 
     # Everything that is not one of the subcommands is an argument of the
     # Claude Code the VM runs, so that claudevm takes what claude takes.
@@ -155,9 +165,9 @@ writeShellApplication {
             ;;
         esac
         umask 077
-        mkdir -p "$config_dir"
-        chmod 0700 "$config_dir"
-        token_tmp=$(mktemp "$config_dir/token.XXXXXXXX")
+        mkdir -p "$claudevm_home"
+        chmod 0700 "$claudevm_home"
+        token_tmp=$(mktemp "$claudevm_home/token.XXXXXXXX")
         trap 'rm -f "$token_tmp"' EXIT
         printf '%s\n' "$token" > "$token_tmp"
         mv -fT "$token_tmp" "$token_file"
@@ -326,11 +336,20 @@ writeShellApplication {
       exit 1
     fi
 
-    runtime=$(mktemp -d "''${XDG_RUNTIME_DIR:-/tmp}/claudevm.XXXXXXXX")
+    # The VM sees the launch directory inside the runtime directory through
+    # a share of its own, which the share checks of the inputs do not
+    # cover.
+    runtime_parent=$(realpath -e "''${XDG_RUNTIME_DIR:-/tmp}")
+    if contains "$claudevm_home" "$runtime_parent"; then
+      refuse "the launch directory under $runtime_parent" "it lies inside $claudevm_home"
+    fi
+    runtime=$(mktemp -d "$runtime_parent/claudevm.XXXXXXXX")
     qemu_pid=
     virtiofsd_pid=
     broker_pid=
     git_before=
+    # The transcripts input sets this once it has created the directory.
+    session_dir=
     saved_stty=$(stty -g 2>/dev/null || true)
 
     cleanup() {
@@ -349,6 +368,9 @@ writeShellApplication {
       if [ -n "$broker_pid" ]; then
         kill "$broker_pid" 2>/dev/null || true
         wait "$broker_pid" 2>/dev/null || true
+      fi
+      if [ -n "$session_dir" ]; then
+        rmdir --ignore-fail-on-non-empty "$session_dir" || true
       fi
       if [ "$status" -ne 0 ]; then
         for log in virtiofsd.log broker.log; do

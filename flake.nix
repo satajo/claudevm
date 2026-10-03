@@ -1,5 +1,5 @@
 {
-  description = "Run Claude Code with bypassed permissions inside an ephemeral QEMU microVM that shares only the working directory read-write";
+  description = "Run Claude Code with bypassed permissions inside an ephemeral QEMU microVM";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

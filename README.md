@@ -1,14 +1,15 @@
 # claudevm
 
 Runs Claude Code with `--dangerously-skip-permissions` in an ephemeral QEMU
-microVM (microvm.nix). The VM can write the current directory and the extra
-directories `claudevm.toml` marks writable; it can read the host nix store,
-the read-only extra directories and the plugin directories `claudevm.toml`
-lists; nothing else on the host filesystem is shared. Claude Code in the VM
-starts from the image's own defaults and gets nothing from `~/.claude`. Your
-login token stays on the host, behind a broker that the VM reaches with a
-per-session dummy key. When the session ends the VM powers off and all its
-state outside the shared directories is gone.
+microVM (microvm.nix). The VM can write the current directory, the extra
+directories `claudevm.toml` marks writable and the session directory that
+keeps its transcripts; it can read the host nix store, the read-only extra
+directories and the plugin directories `claudevm.toml` lists; nothing else
+on the host filesystem is shared. Claude Code in the VM starts from the
+image's own defaults and gets nothing from `~/.claude`. Your login token
+stays on the host, behind a broker that the VM reaches with a per-session
+dummy key. When the session ends the VM powers off and all its state
+outside the shared directories is gone.
 
 ## Usage
 
@@ -49,9 +50,11 @@ SIGINT, SIGHUP or SIGTERM stops QEMU, virtiofsd and the broker.
 
 ### Token
 
-Every launch requires a token in `~/.config/claudevm/token`
-(`$XDG_CONFIG_HOME/claudevm/token` when `XDG_CONFIG_HOME` is an absolute
-path) and refuses to start without one. `claudevm login` stores it:
+Every launch requires a token in the claudevm directory, `~/claudevm/token`,
+and refuses to start without one. The environment variable `CLAUDEVM_HOME`
+puts the claudevm directory elsewhere; it must be an absolute path, and
+`claudevm` refuses to run with a relative or empty one. `claudevm login`
+stores the token:
 
 - On a terminal it runs `claude setup-token` on the host, which signs you in
   through the browser and prints a long-lived OAuth token, and then asks you
@@ -70,6 +73,49 @@ host loopback and gives the guest only a random API key made for that
 session. Claude Code in the guest sends its API requests to the broker,
 which accepts those that carry the session key, swaps the key for the token
 and passes them on to `api.anthropic.com`.
+
+### Sessions
+
+The host keeps the transcripts of every session in the claudevm directory,
+in a session directory of its own per launch:
+
+```
+~/claudevm/
+  token
+  sessions/
+    2026-10-03T14-22-05Z-some-repo/       one per launch
+      -home-you-projects-some-repo/       written by Claude Code from here down
+        <id>.jsonl
+        <id>/subagents/agent-<id>.jsonl, agent-<id>.meta.json
+        <id>/tool-results/...
+```
+
+- A session directory is named after the UTC time the launch starts and
+  the workspace's name, cut to its first 200 bytes, with `-2`, `-3` and so
+  on appended while the name is taken. The launch summary shows it on its
+  `session` line. `sessions` and every session directory are created with
+  mode 0700, and every launch sets `sessions` to 0700 again. The VM owns
+  its session directory and can change its mode, so `sessions` is what
+  keeps the transcripts private.
+- The guest sees its session directory read-write as the agent's
+  `~/.claude/projects`, where Claude Code writes as it does on the host: its
+  own JSONL transcripts, one file per conversation and one per subagent.
+  Files reach the host as they are written and are owned by you there.
+- The VM sees its own launch's session directory and nothing else of the
+  claudevm directory: `claudevm` refuses a workspace, mount or plugin
+  directory that lies inside the claudevm directory, as it refuses one that
+  contains it, and a launch whose runtime directory, `$XDG_RUNTIME_DIR` or
+  else `/tmp`, lies inside it.
+- `claudevm` never deletes a session directory that holds anything. One
+  that is still empty when `claudevm` exits, as after a `claudevm shell`
+  that ran no `claude` or a launch that failed before the VM started, is
+  removed; `sessions` itself stays. Old sessions are yours to remove.
+- Each launch starts with an empty `~/.claude/projects`, so
+  `claude --resume` in the VM finds only the conversations of that launch.
+- The guest writes the session directory, so treat its content with the
+  same caution as the workspace: a transcript holds whatever the agent read
+  and wrote, prompt injections included, and a session directory can hold
+  any file the VM put there.
 
 ## Configuration
 
@@ -102,11 +148,11 @@ writable = false  # default false: read-only
   you on the host.
 - `claudevm` refuses a mount path that does not exist, is not a directory,
   is or contains `$HOME` (directories under it are fine), contains
-  `~/.claude`, `~/.claude.json`, the token file or its directory, lies
-  inside `~/.claude`, contains a directory the guest system needs, such as
-  `/etc`, `/tmp` or `/var` (directories under them are fine), or overlaps
-  the workspace, `/nix`, a guest path the VM uses (`/mnt/launch`,
-  `/home/agent`) or another mount.
+  `~/.claude`, `~/.claude.json`, the token file or the claudevm directory,
+  lies inside `~/.claude` or the claudevm directory, contains a directory
+  the guest system needs, such as `/etc`, `/tmp` or `/var` (directories
+  under them are fine), or overlaps the workspace, `/nix`, a guest path the
+  VM uses (`/mnt/launch`, `/home/agent`) or another mount.
 - `forward_packages` puts programs on the agent's PATH. Each entry is a nix
   flake installable, passed as written to `nix build` on the host except
   that a leading `~/` is expanded, so `ripgrep` alone fails where
@@ -142,10 +188,10 @@ writable = false  # default false: read-only
   inside the VM by design; after a session that changed it, `claudevm`
   prints a NOTICE. Every launch prints the effective configuration
   after the builds and before the VM starts: the workspace, each mount with
-  `ro` or `rw`, one `plugin` line per `plugin_mounts` entry, with `ro` when
-  the entry has a share of its own, each `forward_packages` entry, the
-  `user.name` and `user.email` that git in the VM gets, the broker's port
-  and token file, vcpu and memory.
+  `ro` or `rw`, the session directory, one `plugin` line per
+  `plugin_mounts` entry, with `ro` when the entry has a share of its own,
+  each `forward_packages` entry, the `user.name` and `user.email` that git
+  in the VM gets, the broker's port and token file, vcpu and memory.
 
 ## What the VM can and cannot do
 
@@ -154,6 +200,7 @@ Host                            Guest
 ----                            -----
 $PWD                rw   --->   same path
 [[mounts]] dirs     ro   --->   same path             rw with writable = true
+session directory   rw   --->   ~/.claude/projects    and the same path
 plugin_mounts dirs  ro   --->   same path
 forward_packages    built       their bin dirs first on PATH
 git identity        copied      user.name and user.email, nothing else of
@@ -166,6 +213,7 @@ claudevm arguments  passed      to claude, or the debug shell instead
 /nix/store          ro   --->   /nix/store            not listable; rw overlay
 ~/.claude           not shared
 ~/.claude.json      not shared
+rest of ~/claudevm  not shared
 host loopback       blocked except the broker's port and DNS
 LAN                 blocked except DNS, as are CGNAT, link-local, multicast
 host's resolver     DNS through 10.0.2.3, which QEMU forwards to it
@@ -180,10 +228,10 @@ everything else     not shared
 - Workspace: shared read-write over virtiofs, live in both directions. Files
   the agent creates are owned by you on the host. `claudevm` refuses a
   workspace whose path, after resolving symlinks, is or contains `$HOME`,
-  `~/.claude`, `~/.claude.json`, the token file or its directory, lies
-  inside `~/.claude`, contains a directory the guest system needs, such as
-  `/etc`, `/tmp` or `/var`, or overlaps `/nix` or a guest path the VM uses
-  (`/mnt/launch`, `/home/agent`).
+  `~/.claude`, `~/.claude.json`, the token file or the claudevm directory,
+  lies inside `~/.claude` or the claudevm directory, contains a directory
+  the guest system needs, such as `/etc`, `/tmp` or `/var`, or overlaps
+  `/nix` or a guest path the VM uses (`/mnt/launch`, `/home/agent`).
 - Claude config: Claude Code starts from the image's defaults, which mark
   onboarding as completed, the bypass permissions prompt as accepted and the
   workspace as trusted, select the dark theme, turn off syncing of the
@@ -191,9 +239,9 @@ everything else     not shared
   traffic and auto-updates. Nothing comes from the host's `~/.claude` or
   `~/.claude.json`. Project config comes from the workspace, where Claude
   Code reads `CLAUDE.md`, `.claude/` and `.mcp.json` as it does on the host
-  in a trusted folder. Transcripts, prompt history and the rest of the VM's
-  own Claude state are discarded with the VM, so `claude --resume` does not
-  work across runs.
+  in a trusted folder. The transcripts stay on the host in the session
+  directory; prompt history and the rest of the VM's own Claude state are
+  discarded with the VM.
 - Token: the guest holds only the session's dummy key. Its Claude Code sends
   API requests to the broker on the host loopback, which QEMU's user-mode
   networking exposes at 10.0.2.2. The broker swaps the key for the token and
@@ -311,8 +359,9 @@ everything else     not shared
   agent can.
 - Anything running in the VM can send API requests through the broker while
   the session lasts, and so use your account; it cannot read the token.
-- The workspace and writable mounts can grow until the host filesystem they
-  live on is full, so a runaway process in the VM can fill the host disk.
+- The workspace, writable mounts and the session directory can grow until
+  the host filesystem they live on is full, so a runaway process in the VM
+  can fill the host disk.
 - When the session runs out of memory, the process the kernel kills is the
   one that holds the most, which can be Claude Code itself, for example
   when files in the VM's RAM rather than a process hold the memory; the
