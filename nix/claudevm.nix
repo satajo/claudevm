@@ -1,4 +1,4 @@
-{ lib, writeShellApplication, coreutils, findutils, jq, toml2json, guest, broker }:
+{ lib, writeShellApplication, coreutils, findutils, git, jq, toml2json, guest, broker }:
 
 let
   runner = guest.microvm.declaredRunner;
@@ -101,7 +101,7 @@ let
 in
 writeShellApplication {
   name = "claudevm";
-  runtimeInputs = [ coreutils findutils jq toml2json ];
+  runtimeInputs = [ coreutils findutils git jq toml2json ];
   text = ''
     usage() {
       cat >&2 <<'EOF'
@@ -575,6 +575,29 @@ writeShellApplication {
       echo "claudevm: warning: $workspace/.git is a file whose git directory lies outside the workspace; git will not work inside the VM" >&2
     fi
 
+    # The identity that git on the host gives a commit made in the
+    # workspace: user.name and user.email as the config files that apply
+    # there set them together. Mostly the user's global config sets them,
+    # which the VM does not see. git config exits with status 1 for a key
+    # that no file sets, which the guest then lacks as well.
+    git_identity_keys=()
+    git_identity_values=()
+    for key in user.name user.email; do
+      key_status=0
+      value=$(git config --get "$key") || key_status=$?
+      case $key_status in
+        0)
+          git_identity_keys+=("$key")
+          git_identity_values+=("$value")
+          ;;
+        1) ;;
+        *)
+          echo "claudevm: cannot read $key from the git config" >&2
+          exit 1
+          ;;
+      esac
+    done
+
     # The guest authenticates to the broker with this per-session key, which
     # the broker replaces with the token on the way to the Anthropic API.
     guest_key=sk-ant-api03-claudevm-$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')
@@ -620,6 +643,9 @@ writeShellApplication {
       done
       for installable in "''${forward_installables[@]}"; do
         printf 'claudevm: %-9s  %s  (claudevm.toml)\n' forward "$installable"
+      done
+      for i in "''${!git_identity_keys[@]}"; do
+        printf 'claudevm: %-9s  %s  (git config)\n' "''${git_identity_keys[i]}" "''${git_identity_values[i]}"
       done
       printf 'claudevm: %-9s  %s%s\n' vcpu "$vcpu" "$vcpu_note"
       printf 'claudevm: %-9s  %s MiB%s\n' memory "$memory" "$memory_note"
@@ -684,6 +710,13 @@ writeShellApplication {
     # Paths of the plugin_mounts directories, which the guest sees at their
     # host paths and loads into Claude Code in this order.
     for dir in "''${plugin_dirs[@]}"; do printf '%s\0' "$dir"; done > "$runtime/launch/plugin-dirs"
+
+    # A git config file with the identity keys the host sets, which the
+    # guest makes the global git config of the agent.
+    : > "$runtime/launch/gitconfig"
+    for i in "''${!git_identity_keys[@]}"; do
+      git config --file "$runtime/launch/gitconfig" "''${git_identity_keys[i]}" "''${git_identity_values[i]}"
+    done
 
     git_before=$(git_fingerprint) || git_before=unreadable
 

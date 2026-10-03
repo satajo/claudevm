@@ -143,8 +143,9 @@ writable = false  # default false: read-only
   prints a NOTICE. Every launch prints the effective configuration
   after the builds and before the VM starts: the workspace, each mount with
   `ro` or `rw`, one `plugin` line per `plugin_mounts` entry, with `ro` when
-  the entry has a share of its own, each `forward_packages` entry, vcpu,
-  memory, and the broker's port and token file.
+  the entry has a share of its own, each `forward_packages` entry, the
+  `user.name` and `user.email` that git in the VM gets, vcpu, memory, and
+  the broker's port and token file.
 
 ## What the VM can and cannot do
 
@@ -158,6 +159,8 @@ plugin_mounts dirs  ro   --->   same path
 token               brokered    the guest holds a per-session dummy key
 ~/.claude           not shared
 ~/.claude.json      not shared
+git identity        copied      user.name and user.email, nothing else of
+                                your git config
 host loopback       blocked except the broker's port and DNS
 LAN                 blocked except DNS, as are CGNAT, link-local, multicast
 host's resolver     DNS through 10.0.2.3, which QEMU forwards to it
@@ -251,9 +254,16 @@ everything else     not shared
   does. No process in the VM leaves a core dump: the kernel hands every
   dump to a program that discards it, so none fills the VM's RAM or lands
   in a shared directory.
-- Git: `claudevm` warns at launch if `.git` is a file (linked worktrees,
-  submodules); git will not work inside the VM then. After the session it
-  prints a NOTICE if `.git`, `.git/config` or `.git/hooks` changed.
+- Git: commits made in the VM carry your identity. At launch `claudevm`
+  reads `user.name` and `user.email` as git on the host resolves them in
+  the workspace, conditional includes of your global config included, and
+  makes them the agent's global git config. A key the host does not set
+  stays unset in the VM, where git then refuses to commit as it would on
+  the host. Nothing else of your git config enters the VM: no aliases,
+  signing keys or credential helpers. `claudevm` warns at launch if `.git`
+  is a file (linked worktrees, submodules); git will not work inside the
+  VM then. After the session it prints a NOTICE if `.git`, `.git/config`
+  or `.git/hooks` changed.
 - Configuration: after the session `claudevm` prints a NOTICE if
   `claudevm.toml` changed in any way since the launch read it: its content,
   its mode or the entry itself, for example replaced with a symlink or

@@ -541,7 +541,7 @@ in
     ];
 
     systemd.services.claudevm-home = {
-      description = "Prepare agent home, broker access, the open-file limit, the store ACL, the forward_packages registration, the agent memory limit, the store share's cover and shared directories from the launch share";
+      description = "Prepare agent home, the git identity, broker access, the open-file limit, the store ACL, the forward_packages registration, the agent memory limit, the store share's cover and shared directories from the launch share";
       requires = [ "nftables.service" ];
       after = [ "nftables.service" ];
       unitConfig.RequiresMountsFor = [ "/mnt/launch" ];
@@ -631,6 +631,12 @@ in
           '.customApiKeyResponses.approved = [$key, $key[-20:]]
            | .projects[$workspace].hasTrustDialogAccepted = true' \
           ${claudeState} > ${agent.home}/.claude.json
+        # The launch input "gitconfig" is a git config file that holds the
+        # user.name and user.email with which git on the host commits in the
+        # workspace, each only if the host sets it. As the agent's global
+        # git config it gives commits made in the VM the same identity; the
+        # config of the repository still takes precedence over it.
+        install -o ${agent.name} -g ${agent.group} -m 0600 /mnt/launch/gitconfig ${agent.home}/.gitconfig
         # Claude Code refuses to run when /tmp/claude-<uid>, the directory it
         # keeps its temporary files in, belongs to another user. It is
         # created before the mounts, since the mount loop creates the missing
