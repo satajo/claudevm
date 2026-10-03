@@ -1,6 +1,6 @@
 """Behaviour test of claudevm-broker against a fake upstream on loopback.
 
-Usage: broker-test BROKER_EXECUTABLE
+Usage: claudevm-broker-test BROKER_EXECUTABLE
 """
 
 import faulthandler

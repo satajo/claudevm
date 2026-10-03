@@ -2,6 +2,17 @@
 
 let
   agent = config.users.users.agent;
+  setfacl = lib.getExe' pkgs.acl "setfacl";
+
+  # The host's store itself, the lower layer of the /nix/store overlay.
+  storeShare = {
+    tag = "ro-store";
+    source = "/nix/store";
+    mountPoint = "/nix/.ro-store";
+    proto = "virtiofs";
+    readOnly = true;
+    posixAcl = false;
+  };
 in
 {
   options.claudevm.homeSteps = {
@@ -20,6 +31,7 @@ in
   };
 
   config = {
+    microvm.shares = [ storeShare ];
     microvm.writableStoreOverlay = "/nix/.rw-store";
 
     claudevm.homeSteps = {
@@ -34,22 +46,21 @@ in
         # read-write in a mount namespace of its own; the ACLs are set the
         # same way. Their chmod of the store directory changes the ACL's
         # mask and keeps the entry for agent.
-        unshare --mount -- ${pkgs.runtimeShell} -euc '
-          mount -o remount,bind,rw /nix/store
-          setfacl -m u:${agent.name}:x /nix/store
+        ${lib.getExe' pkgs.util-linux "unshare"} --mount -- ${pkgs.runtimeShell} -euc '
+          ${lib.getExe' pkgs.util-linux "mount"} -o remount,bind,rw /nix/store
+          ${setfacl} -m u:${agent.name}:x /nix/store
           if [ -e /nix/store/.links ]; then
-            setfacl -m u:${agent.name}:x /nix/store/.links
+            ${setfacl} -m u:${agent.name}:x /nix/store/.links
           fi
         '
       '';
 
       storeCover = ''
-        # /nix/.ro-store is the host's store itself, the lower layer of the
-        # /nix/store overlay. The overlay holds its own reference to it, so
+        # The overlay holds its own reference to the store share, so
         # /nix/store keeps working under this empty root-only file system.
-        # systemd counts the cover as part of the mount unit of
-        # /nix/.ro-store, so only root stopping that unit removes it.
-        mount -t tmpfs -o ro,nosuid,nodev,noexec,mode=0700 tmpfs /nix/.ro-store
+        # systemd counts the cover as part of the mount unit of the share,
+        # so only root stopping that unit removes it.
+        ${lib.getExe' pkgs.util-linux "mount"} -t tmpfs -o ro,nosuid,nodev,noexec,mode=0700 tmpfs ${storeShare.mountPoint}
       '';
     };
 

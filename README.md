@@ -144,8 +144,8 @@ writable = false  # default false: read-only
   after the builds and before the VM starts: the workspace, each mount with
   `ro` or `rw`, one `plugin` line per `plugin_mounts` entry, with `ro` when
   the entry has a share of its own, each `forward_packages` entry, the
-  `user.name` and `user.email` that git in the VM gets, vcpu, memory, and
-  the broker's port and token file.
+  `user.name` and `user.email` that git in the VM gets, the broker's port
+  and token file, vcpu and memory.
 
 ## What the VM can and cannot do
 
@@ -155,12 +155,17 @@ Host                            Guest
 $PWD                rw   --->   same path
 [[mounts]] dirs     ro   --->   same path             rw with writable = true
 plugin_mounts dirs  ro   --->   same path
-/nix/store          ro   --->   /nix/store            not listable; rw overlay
-token               brokered    the guest holds a per-session dummy key
-~/.claude           not shared
-~/.claude.json      not shared
+forward_packages    built       their bin dirs first on PATH
 git identity        copied      user.name and user.email, nothing else of
                                 your git config
+token               brokered    the guest holds a per-session dummy key
+TERM, window size   copied      applied once at launch
+ulimit -Hn          derived     bounds the files the guest holds open on a
+                                share
+claudevm arguments  passed      to claude, or the debug shell instead
+/nix/store          ro   --->   /nix/store            not listable; rw overlay
+~/.claude           not shared
+~/.claude.json      not shared
 host loopback       blocked except the broker's port and DNS
 LAN                 blocked except DNS, as are CGNAT, link-local, multicast
 host's resolver     DNS through 10.0.2.3, which QEMU forwards to it
@@ -217,7 +222,7 @@ everything else     not shared
   writable overlay in RAM for what the VM builds. The agent's own tools can
   reach every store path by its name but cannot list `/nix/store` or
   `/nix/store/.links`, and the share the overlay is built on is hidden.
-  That share and the VM's launch input at `/mnt/launch` are enforced
+  That share and the VM's launch directory at `/mnt/launch` are enforced
   read-only by virtiofsd on the host and mounted read-only in the guest.
 - Open files: each virtiofsd of a launch, and QEMU, may hold as many open
   files as your hard limit (`ulimit -Hn`); a virtiofsd answers the guest

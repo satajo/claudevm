@@ -5,31 +5,8 @@ let
   claude = lib.getExe' guest.claudevm.claudeCode "claude";
   sockets = map (share: share.socket)
     (builtins.filter (share: share.proto == "virtiofs") guest.microvm.shares);
-
-  # Guest paths the VM itself relies on. Every shared host directory, the
-  # workspace included, appears in the guest at its host path, so none may
-  # overlap any of them.
-  guestPaths = [ "/nix" guest.users.users.agent.home ]
-    ++ map (share: share.mountPoint) guest.microvm.shares;
-
-  # Guest directories that the system of the VM and Claude Code in it need.
-  # A share may lie under one of them, but a share that contains one would
-  # hide it behind its mount.
-  guestSystemPaths = [
-    "/bin"
-    "/boot"
-    "/dev"
-    "/etc"
-    "/lib"
-    "/proc"
-    "/root"
-    "/run"
-    "/sys"
-    "/tmp"
-    "/usr"
-    "/var"
-    "/tmp/claude-${toString guest.users.users.agent.uid}"
-  ];
+  inputs = guest.claudevm.inputs.ordered;
+  phase = name: lib.concatMapStrings (input: input.${name}) inputs;
 
   configTemplate = ''
     # claudevm reads this file once at launch.
@@ -273,68 +250,7 @@ writeShellApplication {
       exit 1
     fi
 
-    # Nothing the VM can read or write may contain these.
     workspace=$(realpath -e .)
-    protected=(
-      "$(realpath -e "$HOME")"
-      "$(realpath -e "$config_dir")"
-      "$(realpath -e "$token_file")"
-    )
-    # A dangling symlink counts too, since claude on the host creates its
-    # target.
-    claude_dir=
-    if [ -e "$HOME/.claude" ] || [ -L "$HOME/.claude" ]; then
-      claude_dir=$(realpath -m "$HOME/.claude")
-      protected+=("$claude_dir")
-    fi
-    if [ -e "$HOME/.claude.json" ] || [ -L "$HOME/.claude.json" ]; then
-      protected+=("$(realpath -m "$HOME/.claude.json")")
-    fi
-
-    # The host directories shared with the guest at their host paths, in
-    # the order of the launch input "mounts": virtiofs tag, canonical path,
-    # mode (ro or rw), and the name a refusal of a later, overlapping share
-    # gives it.
-    share_tags=()
-    share_paths=()
-    share_modes=()
-    share_names=()
-
-    # add_share TAG PATH MODE SUBJECT NAME adds canonical directory PATH to
-    # the shares unless the VM must not see it. SUBJECT names PATH in its own
-    # refusal and NAME in the refusal of a later share that overlaps it.
-    add_share() {
-      local tag=$1 path=$2 mode=$3 subject=$4 name=$5 protected_path guest_path i
-      for protected_path in "''${protected[@]}"; do
-        if contains "$path" "$protected_path"; then
-          refuse "$subject" "it contains $protected_path"
-        fi
-      done
-      if [ -n "$claude_dir" ] && contains "$claude_dir" "$path"; then
-        refuse "$subject" "it lies inside $claude_dir"
-      fi
-      for guest_path in ${lib.escapeShellArgs guestPaths}; do
-        if overlaps "$guest_path" "$path"; then
-          refuse "$subject" "it overlaps $guest_path, which the VM uses"
-        fi
-      done
-      for guest_path in ${lib.escapeShellArgs guestSystemPaths}; do
-        if contains "$path" "$guest_path"; then
-          refuse "$subject" "it contains $guest_path, which the VM uses"
-        fi
-      done
-      for i in "''${!share_paths[@]}"; do
-        if overlaps "''${share_paths[i]}" "$path"; then
-          refuse "$subject" "it overlaps ''${share_names[i]}"
-        fi
-      done
-      share_tags+=("$tag")
-      share_paths+=("$path")
-      share_modes+=("$mode")
-      share_names+=("$name")
-    }
-
-    add_share workspace "$workspace" rw "$workspace as workspace" "the workspace $workspace"
 
     # The digest of claudevm.toml as this launch reads it, which the NOTICE
     # at exit compares against.
@@ -405,88 +321,10 @@ writeShellApplication {
       fi
     }
 
-    mount_paths=()
-    mount_modes=()
-    for ((i = 0; i < ''${#mount_fields[@]}; i += 2)); do
-      entry="[[mounts]] entry $((i / 2 + 1))"
-      mode=''${mount_fields[i + 1]}
-      resolve_entry_dir "$entry" "''${mount_fields[i]}"
-      add_share "extra''${#share_paths[@]}" "$entry_dir" "$mode" "$entry_dir ($entry)" "$entry_dir of $entry"
-      mount_paths+=("$entry_dir")
-      mount_modes+=("$mode")
-    done
-
-    # in_shared_dir PATH succeeds when canonical PATH lies inside the
-    # workspace or a [[mounts]] directory, through which the guest already
-    # sees it at the same path.
-    in_shared_dir() {
-      local share_path
-      for share_path in "$workspace" "''${mount_paths[@]}"; do
-        if contains "$share_path" "$1"; then
-          return 0
-        fi
-      done
-      return 1
-    }
-
-    # The plugin_mounts directories in claudevm.toml order, each with "own"
-    # when it has a read-only share of its own and "within" when the guest
-    # sees it through the workspace or a [[mounts]] share.
-    plugin_dirs=()
-    plugin_shares=()
-    for i in "''${!plugin_mounts[@]}"; do
-      entry="plugin_mounts entry $((i + 1))"
-      resolve_entry_dir "$entry" "''${plugin_mounts[i]}"
-      if [ ! -f "$entry_dir/.claude-plugin/plugin.json" ]; then
-        config_error "$entry: $entry_dir is not a Claude Code plugin: .claude-plugin/plugin.json is missing"
-      fi
-      for j in "''${!plugin_dirs[@]}"; do
-        if overlaps "''${plugin_dirs[j]}" "$entry_dir"; then
-          refuse "$entry_dir ($entry)" "it overlaps ''${plugin_dirs[j]} of plugin_mounts entry $((j + 1))"
-        fi
-      done
-      if in_shared_dir "$entry_dir"; then
-        plugin_shares+=(within)
-      else
-        add_share "extra''${#share_paths[@]}" "$entry_dir" ro "$entry_dir ($entry)" "$entry_dir of $entry"
-        plugin_shares+=(own)
-      fi
-      plugin_dirs+=("$entry_dir")
-    done
-
     if [ ! -w /dev/kvm ]; then
       echo "claudevm: /dev/kvm is missing or not writable; the VM requires KVM" >&2
       exit 1
     fi
-
-    # virtiofsd holds a host descriptor for every inode of its share that
-    # the guest holds and another for every file the guest has open. QEMU's
-    # user networking holds a host socket for every guest connection, every
-    # ICMP echo request and every guest UDP source port, the last two for up
-    # to 240 s each; the guest's fs.file-max does not bound these, and once
-    # QEMU has spent its limit, new guest connections fail until old ones
-    # expire. Each virtiofsd gets the hard limit of open files as
-    # --rlimit-nofile and QEMU as its soft limit, raised in the subshell
-    # that starts it. The broker and everything else the launcher runs keep
-    # the soft limit claudevm starts with, which bounds the broker's
-    # connections. Each virtiofsd runs a thread per host CPU, keeps
-    # claudevm.virtiofsdReservedFds descriptors and one per thread for
-    # itself and answers the guest with ENFILE once the guest holds the
-    # rest, share_fds, which the guest reads from the launch input "env". A
-    # booted guest holds about 2500 descriptors on the store share; the VM
-    # requires a hard limit of at least 65536 so that this stays a small
-    # part of share_fds.
-    share_nofile=$(ulimit -Hn)
-    if ! [[ $share_nofile =~ ^[1-9][0-9]*$ ]]; then
-      echo "claudevm: the hard limit of open files is '$share_nofile', not a number" >&2
-      exit 1
-    fi
-    if [ "$share_nofile" -lt 65536 ]; then
-      echo "claudevm: the hard limit of open files (ulimit -Hn) is $share_nofile; the VM requires at least 65536" >&2
-      exit 1
-    fi
-    share_threads=$host_vcpu
-    share_fds=$((share_nofile - ${toString guest.claudevm.virtiofsdReservedFds} - share_threads))
 
     runtime=$(mktemp -d "''${XDG_RUNTIME_DIR:-/tmp}/claudevm.XXXXXXXX")
     qemu_pid=
@@ -536,67 +374,11 @@ writeShellApplication {
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
-    # The guest sees the host's /nix/store, so a package built here needs no
-    # download in the VM. The working directory is still the workspace, so
-    # relative flake references resolve against it. Each out-link in the
-    # runtime directory is a GC root that keeps the build for the session;
-    # nix names it fwd<entry>, plus -<output> for an output other than out.
-    forward_installables=()
-    forward_outputs=()
-    forward_dirs=()
-    for i in "''${!forward_packages[@]}"; do
-      entry="forward_packages entry $((i + 1))"
-      installable=''${forward_packages[i]}
-      case $installable in
-        \~/*) installable=$HOME/''${installable#\~/} ;;
-      esac
-      if ! out_paths=$(nix build --print-out-paths --out-link "$runtime/fwd$((i + 1))" -- "$installable"); then
-        config_error "$entry: building '$installable' failed"
-      fi
-      bin_dirs=()
-      while IFS= read -r out_path; do
-        case $out_path in
-          /nix/store/*) ;;
-          *) config_error "$entry: '$installable' built $out_path, which lies outside /nix/store, the only store the VM sees" ;;
-        esac
-        forward_outputs+=("$out_path")
-        if [ -d "$out_path/bin" ]; then
-          bin_dirs+=("$out_path/bin")
-        fi
-      done <<< "$out_paths"
-      if [ "''${#bin_dirs[@]}" -eq 0 ]; then
-        config_error "$entry: '$installable' provides no executables; none of its outputs has a bin directory: ''${out_paths//$'\n'/ }"
-      fi
-      forward_installables+=("$installable")
-      forward_dirs+=("''${bin_dirs[@]}")
-    done
+    ${phase "collect"}
 
     if [ -f "$workspace/.git" ]; then
       echo "claudevm: warning: $workspace/.git is a file whose git directory lies outside the workspace; git will not work inside the VM" >&2
     fi
-
-    # The identity that git on the host gives a commit made in the
-    # workspace: user.name and user.email as the config files that apply
-    # there set them together. Mostly the user's global config sets them,
-    # which the VM does not see. git config exits with status 1 for a key
-    # that no file sets, which the guest then lacks as well.
-    git_identity_keys=()
-    git_identity_values=()
-    for key in user.name user.email; do
-      key_status=0
-      value=$(git config --get "$key") || key_status=$?
-      case $key_status in
-        0)
-          git_identity_keys+=("$key")
-          git_identity_values+=("$value")
-          ;;
-        1) ;;
-        *)
-          echo "claudevm: cannot read $key from the git config" >&2
-          exit 1
-          ;;
-      esac
-    done
 
     # The guest authenticates to the broker with this per-session key, which
     # the broker replaces with the token on the way to the Anthropic API.
@@ -631,104 +413,33 @@ writeShellApplication {
     fi
 
     {
-      printf 'claudevm: %-9s  rw  %s\n' workspace "$workspace"
-      for i in "''${!mount_paths[@]}"; do
-        printf 'claudevm: %-9s  %s  %s  (claudevm.toml)\n' mount "''${mount_modes[i]}" "''${mount_paths[i]}"
-      done
-      for i in "''${!plugin_dirs[@]}"; do
-        case ''${plugin_shares[i]} in
-          own) printf 'claudevm: %-9s  ro  %s  (claudevm.toml)\n' plugin "''${plugin_dirs[i]}" ;;
-          within) printf 'claudevm: %-9s  %s  (claudevm.toml)\n' plugin "''${plugin_dirs[i]}" ;;
-        esac
-      done
-      for installable in "''${forward_installables[@]}"; do
-        printf 'claudevm: %-9s  %s  (claudevm.toml)\n' forward "$installable"
-      done
-      for i in "''${!git_identity_keys[@]}"; do
-        printf 'claudevm: %-9s  %s  (git config)\n' "''${git_identity_keys[i]}" "''${git_identity_values[i]}"
-      done
+      ${phase "summary"}
       printf 'claudevm: %-9s  %s%s\n' vcpu "$vcpu" "$vcpu_note"
       printf 'claudevm: %-9s  %s MiB%s\n' memory "$memory" "$memory_note"
-      printf 'claudevm: %-9s  127.0.0.1:%s -> api.anthropic.com  (token %s)\n' broker "$broker_port" "$token_file"
       echo "claudevm: claude config: image defaults only; token stays on the host; network: IPv4 internet only; LAN, CGNAT, link-local, multicast and host loopback blocked except the broker and DNS"
     } >&2
 
     # From here on the launcher creates files and directories that only
     # their owner can access; virtiofsd sets its own umask for the files
-    # the guest creates. The guest sees the launch input at /mnt/launch with
-    # its owner mapped to agent, so in the guest only agent and root can
-    # read it, the guest key in env included.
+    # the guest creates. The guest sees the launch directory at /mnt/launch
+    # with its owner mapped to agent, so in the guest only agent and root
+    # can read it, the guest key included.
     umask 077
     mkdir "$runtime/launch"
-
-    {
-      printf 'TERM=%q\n' "''${TERM:-xterm-256color}"
-      # The serial console carries no window size, so the guest applies the
-      # launch-time size once.
-      if size=$(stty size 2>/dev/null); then
-        printf 'ROWS=%q\n' "''${size% *}"
-        printf 'COLS=%q\n' "''${size#* }"
-      fi
-      printf 'CLAUDEVM_SESSION=%q\n' "$session"
-      printf 'CLAUDEVM_WORKSPACE=%q\n' "$workspace"
-      printf 'CLAUDEVM_BROKER_PORT=%q\n' "$broker_port"
-      printf 'CLAUDEVM_GUEST_KEY=%q\n' "$guest_key"
-      printf 'CLAUDEVM_SHARE_FDS=%q\n' "$share_fds"
-    } > "$runtime/launch/env"
-
-    for arg in "$@"; do printf '%s\0' "$arg"; done > "$runtime/launch/claude-args"
-
-    # Tag, path and mode of each share, read by virtiofsd-run, by the QEMU
-    # argument script and by the guest, which mounts it at the same path as
-    # the host has it. Each tag is served on the socket <tag>.sock.
-    share_sockets=()
-    for i in "''${!share_paths[@]}"; do
-      printf '%s\0%s\0%s\0' "''${share_tags[i]}" "''${share_paths[i]}" "''${share_modes[i]}"
-      share_sockets+=("''${share_tags[i]}.sock")
-    done > "$runtime/launch/mounts"
-
-    # Bin directories of the forward_packages, read by the guest, which puts
-    # them first on PATH in this order.
-    for dir in "''${forward_dirs[@]}"; do printf '%s\0' "$dir"; done > "$runtime/launch/forward-path"
-
-    # Store paths of the forward_packages outputs, each once, which the
-    # guest makes garbage collection roots.
-    for out_path in "''${forward_outputs[@]}"; do printf '%s\0' "$out_path"; done \
-      | LC_ALL=C sort -zu > "$runtime/launch/forward-outputs"
-
-    # Nix validity registration of the closure of those outputs, which the
-    # guest loads into its Nix database; empty without outputs, for which
-    # nix-store --query prints nothing. nix-store --dump-db without paths
-    # dumps the host's whole database, so xargs -r runs it only when there
-    # are paths.
-    if ! nix-store --query --requisites "''${forward_outputs[@]}" \
-        | xargs -r -d '\n' nix-store --dump-db > "$runtime/launch/forward-registration"; then
-      echo "claudevm: cannot read the nix registration of the forward_packages closure" >&2
-      exit 1
-    fi
-
-    # Paths of the plugin_mounts directories, which the guest sees at their
-    # host paths and loads into Claude Code in this order.
-    for dir in "''${plugin_dirs[@]}"; do printf '%s\0' "$dir"; done > "$runtime/launch/plugin-dirs"
-
-    # A git config file with the identity keys the host sets, which the
-    # guest makes the global git config of the agent.
-    : > "$runtime/launch/gitconfig"
-    for i in "''${!git_identity_keys[@]}"; do
-      git config --file "$runtime/launch/gitconfig" "''${git_identity_keys[i]}" "''${git_identity_values[i]}"
-    done
+    ${phase "write"}
 
     git_before=$(git_fingerprint) || git_before=unreadable
 
     # Share sources and socket paths are relative to the runtime directory.
     cd "$runtime"
 
+    # share_nofile and share_threads come from the descriptor-budget input.
     CLAUDEVM_SHARE_NOFILE=$share_nofile CLAUDEVM_SHARE_THREADS=$share_threads \
       ${runner}/bin/virtiofsd-run > virtiofsd.log 2>&1 &
     virtiofsd_pid=$!
 
     # qemu connects to every vhost-user socket at startup and fails if one
-    # is missing.
+    # is missing. share_sockets holds those of the shares input.
     for sock in ${lib.escapeShellArgs sockets} "''${share_sockets[@]}"; do
       tries=0
       until [ -S "$sock" ]; do

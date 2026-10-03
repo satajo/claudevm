@@ -12,19 +12,7 @@ let
   # and the rest is headroom for their page cache and growth.
   memoryReserveMiB = 256;
 
-  # Each virtiofsd lets the guest hold CLAUDEVM_SHARE_FDS host descriptors,
-  # which the launcher writes into /mnt/launch/env: one for every inode of
-  # its share that the guest kernel holds and one more for every open file
-  # and directory. Once the guest holds them all, the daemon answers every
-  # further open, and every lookup of an inode the guest does not hold yet,
-  # with ENFILE; the host itself never runs out. This sets share_fds.
-  shareBudget = ''
-    share_fds=''${CLAUDEVM_SHARE_FDS:?is not set in /mnt/launch/env}
-    if ! [[ $share_fds =~ ^[1-9][0-9]*$ ]]; then
-      echo "CLAUDEVM_SHARE_FDS=$share_fds is not a positive integer" >&2
-      exit 1
-    fi
-  '';
+  readFdBudget = config.claudevm.inputs.descriptorBudget.read;
 in
 {
   options.claudevm = {
@@ -64,7 +52,7 @@ in
 
     claudevm.homeSteps = {
       openFileLimit = ''
-        ${shareBudget}
+        ${readFdBudget}
         # Processes without CAP_SYS_ADMIN, everything the session runs among
         # them, may hold a quarter of the share budget open. Root's files
         # count towards fs.file-max too, but only root may exceed it. The
@@ -90,7 +78,7 @@ in
           echo "the guest's RAM of $memtotal_kib KiB leaves nothing beyond the reserve of ${toString memoryReserveMiB} MiB" >&2
           exit 1
         fi
-        systemctl set-property --runtime agent.slice MemoryMax=$((agent_kib * 1024))
+        ${config.systemd.package}/bin/systemctl set-property --runtime agent.slice MemoryMax=$((agent_kib * 1024))
       '';
     };
 
@@ -138,9 +126,7 @@ in
       };
       script = ''
         enable -f ${pkgs.runtimeShellPackage}/lib/bash/sleep sleep
-        # shellcheck disable=SC1091
-        . /mnt/launch/env
-        ${shareBudget}
+        ${readFdBudget}
         drop_above=$((share_fds / 2))
         # The last check found the count below the threshold, dropped after
         # a check below it, or found it still above it after a drop.

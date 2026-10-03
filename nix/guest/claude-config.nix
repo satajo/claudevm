@@ -12,15 +12,9 @@ let
     skipDangerousModePermissionPrompt = true;
     syncClaudeAiPlugins = false;
   });
-  # claudevm-home adds the guest key of the launch to the approved custom
-  # API keys. Claude Code looks an approved key up by its last 20
-  # characters; the full key is approved as well so that either lookup
-  # matches. claudevm-home also sets hasTrustDialogAccepted for the
-  # workspace, the record of an accepted workspace trust dialog. Claude
-  # Code requires it, in an interactive session and in a -p run alike,
-  # before it applies the hooks, permissions, extraKnownMarketplaces and
-  # enabledPlugins of a repository's .claude/settings.json and loads the
-  # plugins under its .claude/skills/<name>/.
+  # The ~/.claude.json the image starts from. The setup of the shares input
+  # adds the trust of the workspace and that of broker-access the approval
+  # of the guest key.
   claudeState = pkgs.writeText "claude.json" (builtins.toJSON {
     hasCompletedOnboarding = true;
     theme = "dark";
@@ -28,20 +22,32 @@ let
   });
 in
 {
-  options.claudevm.homeSteps.claudeConfig = lib.mkOption {
-    type = lib.types.str;
-    internal = true;
-    readOnly = true;
-    description = "Step of the claudevm-home script that installs the Claude Code config of the image for agent.";
+  options.claudevm.homeSteps = {
+    claudeConfig = lib.mkOption {
+      type = lib.types.str;
+      internal = true;
+      readOnly = true;
+      description = "Step of the claudevm-home script that installs the Claude Code config of the image for agent.";
+    };
+    claudeTmpDir = lib.mkOption {
+      type = lib.types.str;
+      internal = true;
+      readOnly = true;
+      description = "Step of the claudevm-home script that creates the directory of Claude Code's temporary files for agent.";
+    };
   };
 
-  config.claudevm.homeSteps.claudeConfig = ''
-    install -d -o ${agent.name} -g ${agent.group} -m 0700 ${agent.home}/.claude
-    install -o ${agent.name} -g ${agent.group} -m 0600 ${claudeSettings} ${agent.home}/.claude/settings.json
-    install -o ${agent.name} -g ${agent.group} -m 0600 /dev/null ${agent.home}/.claude.json
-    jq --arg key "$CLAUDEVM_GUEST_KEY" --arg workspace "$CLAUDEVM_WORKSPACE" \
-      '.customApiKeyResponses.approved = [$key, $key[-20:]]
-       | .projects[$workspace].hasTrustDialogAccepted = true' \
-      ${claudeState} > ${agent.home}/.claude.json
-  '';
+  config.claudevm.homeSteps = {
+    claudeConfig = ''
+      install -d -o ${agent.name} -g ${agent.group} -m 0700 ${agent.home}/.claude
+      install -o ${agent.name} -g ${agent.group} -m 0600 ${claudeSettings} ${agent.home}/.claude/settings.json
+      install -o ${agent.name} -g ${agent.group} -m 0600 ${claudeState} ${agent.home}/.claude.json
+    '';
+
+    # Claude Code refuses to run when /tmp/claude-<uid>, the directory it
+    # keeps its temporary files in, belongs to another user.
+    claudeTmpDir = ''
+      install -d -o ${agent.name} -g ${agent.group} -m 0700 /tmp/claude-${toString agent.uid}
+    '';
+  };
 }

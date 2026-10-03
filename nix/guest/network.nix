@@ -54,18 +54,18 @@
   services.timesyncd.enable = false;
 
   # Of everything outside the guest, only the internet over IPv4 is
-  # reachable, with three exceptions: DHCP to slirp at 10.0.2.2; DNS
-  # through 10.0.2.3, which slirp forwards to the first nameserver of the
-  # host's resolv.conf, which may be on the host's loopback or its LAN;
-  # and the broker port of the launch, which claudevm-home admits at
-  # boot. slirp sends guest traffic out through the host's network stack,
-  # so a private, CGNAT or link-local destination is the host or its LAN,
-  # and multicast reaches no further than the LAN; slirp hands 10.0.2.2
+  # reachable, with three exceptions: DHCP to slirp at 10.0.2.2; DNS through
+  # 10.0.2.3, which slirp forwards to the first nameserver of the host's
+  # resolv.conf, which may be on the host's loopback or its LAN; and the
+  # broker port of the launch, which the setup of the broker-access input
+  # admits at boot. slirp sends guest traffic out through the host's network
+  # stack, so a private, CGNAT or link-local destination is the host or its
+  # LAN, and multicast reaches no further than the LAN; slirp hands 10.0.2.2
   # and the broadcast address 255.255.255.255 to the host's loopback.
   # networkd sends DHCP renewals and releases from port 68, a privileged
-  # port that agent cannot bind, and its other DHCP messages over a
-  # packet socket, which this hook does not see. reject makes a refused
-  # connection fail at once.
+  # port that agent cannot bind, and its other DHCP messages over a packet
+  # socket, which this hook does not see. reject makes a refused connection
+  # fail at once.
   networking.nftables = {
     enable = true;
     tables.egress = {
