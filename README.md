@@ -330,8 +330,8 @@ everything else     not shared
 
 VM size, extra mounts, plugin mounts and forwarded packages are set per
 project in `claudevm.toml` and take effect at the next launch without rebuilding
-`claudevm`. `claudevm.vcpu` and `claudevm.memory` in `nix/guest.nix` are the
-defaults that `claudevm init` writes and that apply to a key the file leaves
-out. `claudevm.claudeCode` is the Claude Code of the VM and of
+`claudevm`. `claudevm.vcpu` and `claudevm.memory` in `nix/guest/machine.nix`
+are the defaults that `claudevm init` writes and that apply to a key the file
+leaves out. `claudevm.claudeCode` is the Claude Code of the VM and of
 `claudevm login`, by default the `claude-code` of the nixpkgs in
 `flake.lock`.

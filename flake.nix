@@ -18,13 +18,13 @@
       nixosConfigurations.claudevm = nixpkgs.lib.nixosSystem {
         inherit system;
         modules = [
+          ./nix/guest
           microvm.nixosModules.microvm
-          ./nix/guest.nix
         ];
       };
 
       packages.${system} = {
-        broker = pkgs.callPackage ./nix/broker.nix { };
+        broker = pkgs.callPackage ./nix/broker { };
         claudevm = pkgs.callPackage ./nix/claudevm.nix {
           guest = self.nixosConfigurations.claudevm.config;
           broker = self.packages.${system}.broker;
@@ -34,7 +34,7 @@
 
       checks.${system} = {
         inherit (self.packages.${system}) claudevm broker;
-        broker-test = pkgs.callPackage ./nix/broker-test.nix {
+        broker-test = pkgs.callPackage ./nix/broker/test.nix {
           broker = self.packages.${system}.broker;
         };
       };
