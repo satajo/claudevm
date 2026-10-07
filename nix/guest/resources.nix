@@ -97,11 +97,12 @@ in
     # The fuse_inode line of /proc/slabinfo counts the inodes of all shares
     # together, and its active objects include the free objects of per-CPU
     # slabs, so the count errs high. The line always exists: the cache has
-    # a constructor, so the kernel never merges it into another. A write to
-    # drop_caches with bit 2 frees the unused overlay dentries and the
-    # virtiofs dentries and inodes they held, and a small residue can remain
-    # until the next write; bit 4 keeps the kernel from logging every write
-    # after the first.
+    # a constructor, so the kernel never merges it into another. A write of
+    # 2 to drop_caches frees the unused overlay dentries and the virtiofs
+    # dentries and inodes they held, and a small residue can remain until
+    # the next write. drop_caches takes only the values 1 to 4, so bit 4,
+    # which keeps the kernel from logging the writes that follow, cannot
+    # join a drop: the script writes 4 alone once at its start.
     #
     # The check runs in one long-lived process that uses bash builtins only
     # and so starts no program: starting one opens files on the store, which
@@ -128,6 +129,7 @@ in
         enable -f ${pkgs.runtimeShellPackage}/lib/bash/sleep sleep
         ${readFdBudget}
         drop_above=$((share_fds / 2))
+        echo 4 > /proc/sys/vm/drop_caches
         # The last check found the count below the threshold, dropped after
         # a check below it, or found it still above it after a drop.
         state=below
@@ -153,7 +155,7 @@ in
                 state=held
                 ;;
             esac
-            echo 6 > /proc/sys/vm/drop_caches
+            echo 2 > /proc/sys/vm/drop_caches
           fi
           sleep 1
         done

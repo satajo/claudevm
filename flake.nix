@@ -37,6 +37,9 @@
         broker-test = pkgs.callPackage ./nix/broker/test.nix {
           broker = self.packages.${system}.broker;
         };
+        share-inodes-test = pkgs.callPackage ./nix/guest/share-inodes-test.nix {
+          guest = self.nixosConfigurations.claudevm.config;
+        };
       };
     };
 }
