@@ -22,7 +22,7 @@ let
   # Guest paths the VM itself relies on. Every shared host directory, the
   # workspace included, appears in the guest at its host path, so none may
   # overlap any of them.
-  guestPaths = [ "/nix" agent.home ]
+  guestPaths = [ "/nix" agent.home config.claudevm.diskMountPoint ]
     ++ map (share: share.mountPoint) config.microvm.shares;
 
   # Guest directories that the system of the VM and Claude Code in it need.

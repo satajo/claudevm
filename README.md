@@ -30,13 +30,16 @@ packages. The commands are then `claudevm`, `claudevm init`,
 `login` and `shell` subcommands goes to the Claude Code running in the VM.
 
 Boot waits for the guest network and takes about ten seconds. When Claude
-Code exits, the VM powers off and `claudevm` cleans up; a failed guest mount
-also powers it off. Processes that Claude Code leaves running get SIGTERM
-and three seconds to exit; any still running then are killed, and the VM
-powers off five seconds later. Nothing else in the VM delays the power-off,
-and every write a process in the VM completed has reached the host before
-it; a file that a killed process was still writing stays as far as it got.
-SIGINT, SIGHUP or SIGTERM stops QEMU, virtiofsd and the broker.
+Code exits, the VM powers off and `claudevm` cleans up; a guest mount that
+fails at any stage of the boot, the format and mount of the VM's disk
+included, also powers it off. Processes that Claude Code leaves running get
+SIGTERM and three seconds to exit; any still running then are killed, and
+the VM powers off five seconds later. Nothing else in the VM delays the
+power-off but the kernel writing out the file data it still caches for the
+VM's disk, which its dirty-page limit bounds. Every write to a shared
+directory that a process in the VM completed has reached the host before
+the power-off; a file that a killed process was still writing stays as far
+as it got. SIGINT, SIGHUP or SIGTERM stops QEMU, virtiofsd and the broker.
 
 - `claudevm shell` gives a debug shell instead of Claude Code, and takes no
   arguments. `claude` works in it with the same API access as the session.
@@ -45,8 +48,11 @@ SIGINT, SIGHUP or SIGTERM stops QEMU, virtiofsd and the broker.
 - The terminal size is applied once at launch; resizes do not reach the
   serial console. Host environment variables other than `TERM` stay out.
 - The exit status is QEMU's, not Claude Code's; 1 if a launch check fails, a
-  `forward_packages` build fails, or virtiofsd or the broker dies
-  mid-session; 2 on a usage error; 129/130/143 on SIGHUP/SIGINT/SIGTERM.
+  `forward_packages` build fails, the disks directory is a symlink or cannot
+  be created or set to mode 0700, the VM's disk image cannot be created,
+  opened, unnamed or sized, or virtiofsd or the broker dies mid-session; 2
+  on a usage error; 129/130/143 on SIGHUP/SIGINT/SIGTERM, also when more
+  signals follow during the cleanup.
 
 ### Token
 
@@ -82,6 +88,8 @@ in a session directory of its own per launch:
 ```
 ~/claudevm/
   token
+  disks/                                  the VM's disk while a launch runs;
+                                          normally empty, see Disk below
   sessions/
     2026-10-03T14-22-05Z-some-repo/       one per launch
       -home-you-projects-some-repo/       written by Claude Code from here down
@@ -127,6 +135,7 @@ session apply from the next launch. Every key is optional:
 ```toml
 vcpu = 4          # default 4, clamped to 1..host CPUs
 memory = 4096     # MiB, default 4096, clamped to 512..host MemTotal
+disk = 32768      # MiB, default 32768, at least 1024
 forward_packages = ["nixpkgs#ripgrep", ".#mytool", "~/code/tool#cli"]
 plugin_mounts = ["~/code/some-plugin", "/opt/claude-plugins/review"]
 
@@ -135,10 +144,11 @@ path = "~/data"   # absolute, or starting with ~/
 writable = false  # default false: read-only
 ```
 
-- Unknown keys, wrong types, values that are not positive integers and empty
-  `forward_packages` or `plugin_mounts` entries are errors, reported before
-  anything starts. `graphics` and `resolution` are reserved and rejected as
-  not implemented yet.
+- Unknown keys, wrong types, values that are not positive integers, a
+  `disk` below 1024 and empty `forward_packages` or `plugin_mounts` entries
+  are errors, reported before anything starts. `disk` is never clamped: no
+  host value bounds it. `graphics` and `resolution` are reserved and
+  rejected as not implemented yet.
 - A clamped value is shown as `(clamped from N)`. `memory = 2048` launches
   with 2047 MiB, because QEMU's microvm machine hangs at boot with exactly
   2 GiB.
@@ -152,7 +162,7 @@ writable = false  # default false: read-only
   lies inside `~/.claude` or the claudevm directory, contains a directory
   the guest system needs, such as `/etc`, `/tmp` or `/var` (directories
   under them are fine), or overlaps the workspace, `/nix`, a guest path the
-  VM uses (`/mnt/launch`, `/home/agent`) or another mount.
+  VM uses (`/mnt/launch`, `/mnt/disk`, `/home/agent`) or another mount.
 - `forward_packages` puts programs on the agent's PATH. Each entry is a nix
   flake installable, passed as written to `nix build` on the host except
   that a leading `~/` is expanded, so `ripgrep` alone fails where
@@ -191,7 +201,7 @@ writable = false  # default false: read-only
   `ro` or `rw`, the session directory, one `plugin` line per
   `plugin_mounts` entry, with `ro` when the entry has a share of its own,
   each `forward_packages` entry, the `user.name` and `user.email` that git
-  in the VM gets, the broker's port and token file, vcpu and memory.
+  in the VM gets, the broker's port and token file, vcpu, memory and disk.
 
 ## What the VM can and cannot do
 
@@ -211,6 +221,10 @@ ulimit -Hn          derived     bounds the files the guest holds open on a
                                 share
 claudevm arguments  passed      to claude, or the debug shell instead
 /nix/store          ro   --->   /nix/store            not listable; rw overlay
+                                                      on the VM's disk
+~/claudevm/disks    created     the VM's disk         /tmp, /var/tmp, /home, the
+                                                      store's rw overlay and nix
+                                                      build dirs
 ~/.claude           not shared
 ~/.claude.json      not shared
 rest of ~/claudevm  not shared
@@ -231,7 +245,8 @@ everything else     not shared
   `~/.claude`, `~/.claude.json`, the token file or the claudevm directory,
   lies inside `~/.claude` or the claudevm directory, contains a directory
   the guest system needs, such as `/etc`, `/tmp` or `/var`, or overlaps
-  `/nix` or a guest path the VM uses (`/mnt/launch`, `/home/agent`).
+  `/nix` or a guest path the VM uses (`/mnt/launch`, `/mnt/disk`,
+  `/home/agent`).
 - Claude config: Claude Code starts from the image's defaults, which mark
   onboarding as completed, the bypass permissions prompt as accepted and the
   workspace as trusted, select the dark theme, turn off syncing of the
@@ -267,11 +282,31 @@ everything else     not shared
   server: its clock is kvm-clock, which takes the time from the host and
   keeps in step with it.
 - Store: the guest's `/nix/store` shows the host's store read-only, with a
-  writable overlay in RAM for what the VM builds. The agent's own tools can
-  reach every store path by its name but cannot list `/nix/store` or
-  `/nix/store/.links`, and the share the overlay is built on is hidden.
+  writable overlay on the VM's disk for what the VM builds. The agent's own
+  tools can reach every store path by its name but cannot list `/nix/store`
+  or `/nix/store/.links`, and the share the overlay is built on is hidden.
   That share and the VM's launch directory at `/mnt/launch` are enforced
   read-only by virtiofsd on the host and mounted read-only in the guest.
+- Disk: every launch creates an empty file in the disks directory,
+  `~/claudevm/disks`, opens it, deletes its name, makes it a sparse file of
+  `disk` MiB and starts QEMU on the open file as the VM's disk. The
+  directory is therefore normally empty, and the host frees the file when
+  QEMU exits, however the launch ends. A launch killed with SIGKILL, or a
+  host crash, in the few system calls between creating the file and deleting
+  its name leaves an empty `disk.*` file, which a later launch deletes once
+  it is a minute old. The guest formats the disk ext4 at boot and keeps
+  there what it writes to `/tmp`, `/var/tmp` and the agent's home, the
+  store's writable overlay and Nix's build directories; all of it is
+  discarded with the launch. The file grows with what the guest stores, plus
+  the ext4 journal, about 260 MiB at the default size, and shows in `df` but
+  not in `du`. Deleted files in the guest return their space to the host. A
+  full disk gives ENOSPC to the writer, as a full file system does, and the
+  session goes on; deleting files frees the space again. A full host file
+  system ends the VM: the guest's file system stops at its next write after
+  the one that failed, the guest kernel panics and QEMU exits with status 0;
+  data that a program wrote without fsync just before is lost with the VM.
+  `claudevm` refuses a disks directory that is a symlink, as it does a
+  sessions directory.
 - Open files: each virtiofsd of a launch, and QEMU, may hold as many open
   files as your hard limit (`ulimit -Hn`); a virtiofsd answers the guest
   with ENFILE before it runs out itself. It holds one for every file and
@@ -286,27 +321,30 @@ everything else     not shared
   stat of such paths fail too until then.
 - Memory: the session and the Nix daemon, with the builds it runs for the
   session, may together hold the guest's RAM less a fixed reserve of 256
-  MiB, files they write to the VM's RAM-backed file systems included; the
-  guest has no swap. The reserve holds the kernel's own memory, PID 1, the
-  journal, which keeps at most 16 MiB, and the guest's other services, and
-  is the same at every `memory`. The guest's RAM is what its kernel
-  reports, somewhat less than `memory`: 3917 MiB at 4096. When the session
-  and the daemon reach their limit, the kernel kills the one process among
-  them that holds the most memory, and the session goes on as long as
-  Claude Code or the debug shell itself runs.
+  MiB, files they write to `/dev/shm` included; the guest has no swap. File
+  data on the VM's disk counts only as cache, which the kernel writes back
+  and reclaims at the limit, so `memory` is the memory of processes. The
+  reserve holds the kernel's own memory, PID 1, the journal, which keeps at
+  most 16 MiB, and the guest's other services, and is the same at every
+  `memory`. The guest's RAM is what its kernel reports, somewhat less than
+  `memory`: 3917 MiB at 4096. When the session and the daemon reach their
+  limit, the kernel kills the one process among them that holds the most
+  memory, and the session goes on as long as Claude Code or the debug shell
+  itself runs.
 - Nix: flakes are enabled; `nix develop` and `nix build` work inside.
 - Hardening: the guest has no nested virtualization or KVM, no user
   namespaces, no io_uring and no setuid or file-capability programs, `sudo`
   included, and nothing the session runs can gain privileges. Only root can
-  open `/dev/fuse` and the device nodes of the blacklisted vhost, vsock,
-  VFIO and tun modules, which would stay out of the session's reach even
-  with their module loaded. The guest's kernel loads no line discipline on
-  demand and none of the blacklisted modules of unused devices, socket
-  families and netlink protocols. Claude Code's own sandbox mode and other
-  tools built on bubblewrap therefore do not work in the VM; `nix build`
-  does. No process in the VM leaves a core dump: the kernel hands every
-  dump to a program that discards it, so none fills the VM's RAM or lands
-  in a shared directory.
+  read the VM's disk as a block device, and setuid bits and device nodes
+  on it have no effect. Only root can open `/dev/fuse` and the device nodes
+  of the blacklisted vhost, vsock, VFIO and tun modules, which would stay
+  out of the session's reach even with their module loaded. The guest's
+  kernel loads no line discipline on demand and none of the blacklisted
+  modules of unused devices, socket families and netlink protocols. Claude
+  Code's own sandbox mode and other tools built on bubblewrap therefore do
+  not work in the VM; `nix build` does. No process in the VM leaves a core
+  dump: the kernel hands every dump to a program that discards it, so none
+  fills the VM's disk or RAM or lands in a shared directory.
 - Git: commits made in the VM carry your identity. At launch `claudevm`
   reads `user.name` and `user.email` as git on the host resolves them in
   the workspace, conditional includes of your global config included, and
@@ -360,11 +398,11 @@ everything else     not shared
 - Anything running in the VM can send API requests through the broker while
   the session lasts, and so use your account; it cannot read the token.
 - The workspace, writable mounts and the session directory can grow until
-  the host filesystem they live on is full, so a runaway process in the VM
-  can fill the host disk.
+  the host filesystem they live on is full, and the VM's disk image up to
+  `disk` MiB, so a runaway process in the VM can fill the host disk.
 - When the session runs out of memory, the process the kernel kills is the
   one that holds the most, which can be Claude Code itself, for example
-  when files in the VM's RAM rather than a process hold the memory; the
+  when files in `/dev/shm` rather than a process hold the memory; the
   session then ends.
 - Shared directories are shared as they are, so a symlink inside one
   resolves inside the VM, not on the host: it reaches a host file only when
@@ -375,6 +413,8 @@ everything else     not shared
 - x86_64 Linux host with Nix and flakes enabled.
 - `/dev/kvm` writable by you. There is no software-emulation fallback.
 - A hard limit of open files (`ulimit -Hn`) of at least 65536.
+- The claudevm directory on a disk file system with room for the VM's
+  disk: one in RAM, such as a tmpfs, would hold the disk's data in RAM.
 - Unprivileged user namespaces for virtiofsd's sandbox (Ubuntu 24.04's
   AppArmor policy blocks them by default).
 - A token stored with `claudevm login`. `claude setup-token`, which makes
@@ -385,7 +425,7 @@ everything else     not shared
 VM size, extra mounts, plugin mounts and forwarded packages are set per
 project in `claudevm.toml` and take effect at the next launch without rebuilding
 `claudevm`. `claudevm.vcpu` and `claudevm.memory` in `nix/guest/machine.nix`
-are the defaults that `claudevm init` writes and that apply to a key the file
-leaves out. `claudevm.claudeCode` is the Claude Code of the VM and of
-`claudevm login`, by default the `claude-code` of the nixpkgs in
-`flake.lock`.
+and `claudevm.disk` in `nix/guest/disk.nix` are the defaults that
+`claudevm init` writes and that apply to a key the file leaves out.
+`claudevm.claudeCode` is the Claude Code of the VM and of `claudevm login`,
+by default the `claude-code` of the nixpkgs in `flake.lock`.

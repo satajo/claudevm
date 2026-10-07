@@ -21,11 +21,18 @@ in
   # The session owns the serial console instead of a login prompt.
   systemd.services."serial-getty@ttyS0".enable = false;
 
-  # A failed mount starts emergency mode, which with the locked root
-  # account would leave the VM running with no session.
+  # A failed mount starts emergency mode, in the initrd and in stage 2
+  # alike, which with the locked root account would leave the VM running
+  # with no session. The initrd has no logind, which systemctl poweroff
+  # asks first, printing an error, so there emergency mode starts
+  # poweroff.target itself.
   systemd.services.emergency.serviceConfig.ExecStart = lib.mkForce [
     ""
     "${config.systemd.package}/bin/systemctl --no-block poweroff"
+  ];
+  boot.initrd.systemd.services.emergency.serviceConfig.ExecStart = [
+    ""
+    "systemctl --no-block start poweroff.target"
   ];
 
   systemd.services.claude-session = {
@@ -40,9 +47,10 @@ in
       # system call without stopping any other unit, so nothing else
       # running in the guest delays it; for a failed unit it waits 5 s
       # first. Nothing in the guest needs an orderly shutdown: the root
-      # file system lives in RAM, and virtiofsd-run serves the shares
-      # without writeback caching, so a write to a shared directory has
-      # reached the host when the write call returns.
+      # file system lives in RAM, the disk's content is discarded with the
+      # launch, and virtiofsd-run serves the shares without writeback
+      # caching, so a write to a shared directory has reached the host
+      # when the write call returns.
       SuccessAction = "poweroff-immediate";
       FailureAction = "poweroff-immediate";
     };

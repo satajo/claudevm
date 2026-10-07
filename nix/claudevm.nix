@@ -6,12 +6,14 @@ let
   sockets = map (share: share.socket)
     (builtins.filter (share: share.proto == "virtiofs") guest.microvm.shares);
   inputs = guest.claudevm.inputs.ordered;
+  diskFds = guest.claudevm.diskFds;
   phase = name: lib.concatMapStrings (input: input.${name}) inputs;
 
   configTemplate = ''
     # claudevm reads this file once at launch.
     vcpu = ${toString guest.claudevm.vcpu}
     memory = ${toString guest.claudevm.memory}  # MiB
+    disk = ${toString guest.claudevm.disk}  # MiB
 
     # forward_packages = ["nixpkgs#ripgrep", ".#mytool"]
 
@@ -23,9 +25,9 @@ let
   '';
 
   # Checks the JSON form of claudevm.toml. On errors it prints them and
-  # exits 1; otherwise it emits NUL-terminated vcpu, memory, the number of
-  # mounts, a path and mode (ro or rw) pair per mount, the number of
-  # forward_packages entries, those entries and then the plugin_mounts
+  # exits 1; otherwise it emits NUL-terminated vcpu, memory, disk, the
+  # number of mounts, a path and mode (ro or rw) pair per mount, the number
+  # of forward_packages entries, those entries and then the plugin_mounts
   # entries.
   parseConfig = ''
     def is_positive_integer: type == "number" and (tojson | test("^[1-9][0-9]*$"));
@@ -40,12 +42,14 @@ let
             else empty end
         end;
     def errors:
-      (unknown_keys(["vcpu", "memory", "forward_packages", "plugin_mounts", "mounts", "graphics", "resolution"])
+      (unknown_keys(["vcpu", "memory", "disk", "forward_packages", "plugin_mounts", "mounts", "graphics", "resolution"])
         | "unknown key '\(.)'"),
       (("graphics", "resolution") as $key | select(has($key)) | "'\($key)' is not implemented yet"),
-      (("vcpu", "memory") as $key
+      (("vcpu", "memory", "disk") as $key
         | select(has($key) and (.[$key] | is_positive_integer | not))
         | "'\($key)' must be a positive integer"),
+      (select(has("disk") and (.disk | is_positive_integer) and .disk < ${toString guest.claudevm.diskMinimum})
+        | "'disk' must be at least ${toString guest.claudevm.diskMinimum} (MiB)"),
       string_array_errors("forward_packages"),
       string_array_errors("plugin_mounts"),
       (select(has("mounts")) | .mounts
@@ -68,6 +72,7 @@ let
       else
         (.vcpu // ${toString guest.claudevm.vcpu}),
         (.memory // ${toString guest.claudevm.memory}),
+        (.disk // ${toString guest.claudevm.disk}),
         ((.mounts // []) | length),
         ((.mounts // [])[] | .path, (if .writable then "rw" else "ro" end)),
         ((.forward_packages // []) | length),
@@ -107,6 +112,8 @@ writeShellApplication {
     # The long-lived OAuth token of the user. Only the broker on the host
     # reads it; the VM never sees it.
     token_file=$claudevm_home/token
+    # Where each launch creates the disk image of its VM.
+    disks_dir=$claudevm_home/disks
 
     # Everything that is not one of the subcommands is an argument of the
     # Claude Code the VM runs, so that claudevm takes what claude takes.
@@ -260,6 +267,22 @@ writeShellApplication {
       exit 1
     fi
 
+    # claudevm_home has its symlinks resolved; a disks directory that is a
+    # symlink would put the disk images, and what chmod and the sweep of
+    # stale images act on, outside it.
+    if [ -L "$disks_dir" ]; then
+      echo "claudevm: $disks_dir is a symlink; the disks directory must be a directory" >&2
+      exit 1
+    fi
+    if ! mkdir -p "$disks_dir"; then
+      echo "claudevm: cannot create the disks directory $disks_dir" >&2
+      exit 1
+    fi
+    if ! chmod 0700 "$disks_dir"; then
+      echo "claudevm: cannot set $disks_dir to mode 0700" >&2
+      exit 1
+    fi
+
     workspace=$(realpath -e .)
 
     # The digest of claudevm.toml as this launch reads it, which the NOTICE
@@ -306,11 +329,13 @@ writeShellApplication {
       memory=2047
     fi
 
-    mount_count=''${config[2]}
-    mount_fields=("''${config[@]:3:2 * mount_count}")
-    forward_count=''${config[3 + 2 * mount_count]}
-    forward_packages=("''${config[@]:4 + 2 * mount_count:forward_count}")
-    plugin_mounts=("''${config[@]:4 + 2 * mount_count + forward_count}")
+    disk=''${config[2]}
+
+    mount_count=''${config[3]}
+    mount_fields=("''${config[@]:4:2 * mount_count}")
+    forward_count=''${config[4 + 2 * mount_count]}
+    forward_packages=("''${config[@]:5 + 2 * mount_count:forward_count}")
+    plugin_mounts=("''${config[@]:5 + 2 * mount_count + forward_count}")
 
     # resolve_entry_dir ENTRY PATH sets entry_dir to the canonical path of
     # the directory that claudevm.toml entry ENTRY names by PATH, which is
@@ -345,6 +370,8 @@ writeShellApplication {
     fi
     runtime=$(mktemp -d "$runtime_parent/claudevm.XXXXXXXX")
     qemu_pid=
+    # The name of the disk image while it has one.
+    disk_image=
     virtiofsd_pid=
     broker_pid=
     git_before=
@@ -354,6 +381,12 @@ writeShellApplication {
 
     cleanup() {
       local status=$? git_after config_after log
+      # Signals that arrive during cleanup, which would end it early, are
+      # ignored; the exit status stays that of the first.
+      trap "" HUP INT TERM
+      if [ -n "$disk_image" ]; then
+        rm -f -- "$disk_image" || true
+      fi
       if [ -n "$saved_stty" ]; then
         stty "$saved_stty" 2>/dev/null || true
       fi
@@ -438,6 +471,7 @@ writeShellApplication {
       ${phase "summary"}
       printf 'claudevm: %-9s  %s%s\n' vcpu "$vcpu" "$vcpu_note"
       printf 'claudevm: %-9s  %s MiB%s\n' memory "$memory" "$memory_note"
+      printf 'claudevm: %-9s  %s MiB  (sparse file in %s)\n' disk "$disk" "$disks_dir"
       echo "claudevm: claude config: image defaults only; token stays on the host; network: IPv4 internet only; LAN, CGNAT, link-local, multicast and host loopback blocked except the broker and DNS"
     } >&2
 
@@ -474,14 +508,45 @@ writeShellApplication {
       done
     done
 
+    # The VM's disk is a sparse file of disk MiB that QEMU holds through
+    # the only descriptors of it. It has a name only between mktemp and rm
+    # and holds no data until after the rm, and the host frees it once
+    # QEMU exits. A launch that ends between mktemp and rm without its
+    # cleanup leaves an empty file, which a later launch deletes once it
+    # is a minute old; a running launch holds its name for a few system
+    # calls only.
+    find "$disks_dir" -mindepth 1 -maxdepth 1 -type f -name 'disk.*' -empty -mmin +1 -delete
+    if ! disk_image=$(mktemp "$disks_dir/disk.XXXXXXXX"); then
+      echo "claudevm: cannot create the VM's disk image in $disks_dir" >&2
+      exit 1
+    fi
+    # shellcheck disable=SC2094 # QEMU needs the image open read-write and read-only
+    if ! exec {disk_rw}<>"$disk_image" {disk_ro}<"$disk_image"; then
+      echo "claudevm: cannot open the VM's disk image $disk_image" >&2
+      exit 1
+    fi
+    if ! rm -- "$disk_image"; then
+      echo "claudevm: cannot delete the name of the VM's disk image $disk_image" >&2
+      exit 1
+    fi
+    disk_image=
+    if ! truncate -s "''${disk}M" "/proc/self/fd/$disk_rw"; then
+      echo "claudevm: cannot size the VM's disk image to $disk MiB in $disks_dir" >&2
+      exit 1
+    fi
+
     # A non-interactive shell points the stdin of a background job at
     # /dev/null; <&0 keeps the terminal. The QEMU argument script of the
-    # runner reads the size of the VM from CLAUDEVM_VCPU and CLAUDEVM_MEM.
+    # runner reads the size of the VM from CLAUDEVM_VCPU and CLAUDEVM_MEM,
+    # and QEMU takes the disk image from the descriptors of
+    # claudevm.diskFds.
     (
+      exec ${toString diskFds.readWrite}<&"$disk_rw" ${toString diskFds.readOnly}<&"$disk_ro" {disk_rw}<&- {disk_ro}<&-
       ulimit -Sn "$share_nofile" &&
         CLAUDEVM_VCPU=$vcpu CLAUDEVM_MEM=$memory exec ${runner}/bin/microvm-run
     ) <&0 &
     qemu_pid=$!
+    exec {disk_rw}<&- {disk_ro}<&-
 
     finished=
     status=0

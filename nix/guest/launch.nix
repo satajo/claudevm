@@ -135,7 +135,7 @@ in
       # which nftables.service creates.
       requires = [ "nftables.service" ];
       after = [ "nftables.service" ];
-      unitConfig.RequiresMountsFor = [ "/mnt/launch" ];
+      unitConfig.RequiresMountsFor = [ "/mnt/launch" "/tmp" agent.home ];
       onFailure = [ "poweroff.target" ];
       path = [ pkgs.coreutils ];
       enableStrictShellChecks = true;
@@ -145,14 +145,15 @@ in
         StandardOutput = "journal+console";
         StandardError = "journal+console";
       };
-      # claudeTmpDir runs before the share mounts of shares, which create
-      # the missing parents of a share's path owned by root. claudeConfig
-      # runs before the inputs that build on what it installs: shares and
-      # broker-access add to its ~/.claude.json, and transcripts binds the
-      # session directory into its ~/.claude. The setup of the inputs after
-      # shares runs with the shares mounted: no share may overlap /nix, the
-      # agent's home or the launch directory, and no setup step touches a
-      # path inside a share.
+      # claudeConfig and claudeTmpDir write to the disk, through the
+      # agent's home and /tmp. claudeTmpDir runs before the share mounts of
+      # shares, which create the missing parents of a share's path owned by
+      # root. claudeConfig runs before the inputs that build on what it
+      # installs: shares and broker-access add to its ~/.claude.json, and
+      # transcripts binds the session directory into its ~/.claude. The
+      # setup of the inputs after shares runs with the shares mounted: no
+      # share may overlap /nix, the agent's home, the disk or the launch
+      # directory, and no setup step touches a path inside a share.
       script = lib.concatStrings ([
         steps.openFileLimit
         steps.storeAcl

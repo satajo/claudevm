@@ -165,12 +165,13 @@ in
     # The session and the Nix daemon, in whose cgroup the builds the session
     # asks for run, share one memory budget: together they hold no more
     # than MemoryMax, and either may use all of it. Files that their
-    # processes write to the guest's RAM-backed file systems count against
-    # it too. claudevm-home sets MemoryMax at boot to the guest's RAM less
-    # memoryReserveMiB, before either unit starts. The guest has no swap,
-    # so once the slice reaches MemoryMax the kernel can reclaim only its
-    # page cache and then kills the process of the slice that holds the
-    # most memory.
+    # processes write to /dev/shm count against it too; file data on the
+    # disk counts only as page cache, which the kernel writes back and
+    # reclaims at the limit. claudevm-home sets MemoryMax at boot to the
+    # guest's RAM less memoryReserveMiB, before either unit starts. The
+    # guest has no swap, so once the slice reaches MemoryMax the kernel can
+    # reclaim only its page cache and then kills the process of the slice
+    # that holds the most memory.
     systemd.slices.agent.description = "Claude Code session and Nix daemon";
 
     systemd.services.nix-daemon = {

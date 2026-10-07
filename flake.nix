@@ -40,6 +40,13 @@
         share-inodes-test = pkgs.callPackage ./nix/guest/share-inodes-test.nix {
           guest = self.nixosConfigurations.claudevm.config;
         };
+        launcher-test = pkgs.callPackage ./nix/launcher-test.nix {
+          claudevm = self.packages.${system}.claudevm;
+          guest = self.nixosConfigurations.claudevm.config;
+        };
+        disk-test = pkgs.callPackage ./nix/guest/disk-test.nix {
+          claudevm = self.packages.${system}.claudevm;
+        };
       };
     };
 }

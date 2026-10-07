@@ -32,7 +32,6 @@ in
 
   config = {
     microvm.shares = [ storeShare ];
-    microvm.writableStoreOverlay = "/nix/.rw-store";
 
     claudevm.homeSteps = {
       storeAcl = ''
