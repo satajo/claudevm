@@ -6,6 +6,7 @@
 #            state and may fail the launch
 #   summary  host: its lines of the launch summary
 #   write    host: writes its entry under $runtime/launch and nothing else
+#            there
 #   setup    guest, as root in claudevm-home, before the session
 #   session  guest, as agent in claude-session, just before the exec
 #

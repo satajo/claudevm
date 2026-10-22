@@ -47,6 +47,9 @@
         disk-test = pkgs.callPackage ./nix/guest/disk-test.nix {
           claudevm = self.packages.${system}.claudevm;
         };
+        terminal-test = pkgs.callPackage ./nix/guest/terminal-test.nix {
+          claudevm = self.packages.${system}.claudevm;
+        };
       };
     };
 }

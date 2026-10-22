@@ -508,9 +508,10 @@ writeShellApplication {
 
       cleanup() {
         local status=$? git_after config_after log line
-        # Signals that arrive during cleanup, which would end it early, are
-        # ignored; the exit status stays that of the first.
-        trap "" HUP INT TERM
+        # Signals that arrive during cleanup are ignored: HUP, INT and TERM
+        # would end it early and WINCH would cut its waits short. The exit
+        # status stays that of the first.
+        trap "" HUP INT TERM WINCH
         if [ -n "$disk_image" ]; then
           rm -f -- "$disk_image" || true
         fi
@@ -611,6 +612,11 @@ writeShellApplication {
       # can read it, the guest key included.
       umask 077
       mkdir "$runtime/launch"
+      # send_winsize comes from the terminal input. A send that fails
+      # prints nothing over the session's screen. A resize before the
+      # write of the terminal input has created the FIFO fails to send,
+      # and the size that the write then sends includes it.
+      trap 'send_winsize 2>/dev/null || true' WINCH
       ${splice 2 (phase "write")}
 
       git_before=$(git_fingerprint) || git_before=unreadable
@@ -677,9 +683,25 @@ writeShellApplication {
       qemu_pid=$!
       exec {disk_rw}<&- {disk_ro}<&-
 
-      finished=
-      status=0
-      wait -n -p finished "$qemu_pid" "$virtiofsd_pid" "$broker_pid" || status=$?
+      # await_exit PID... waits until one of the children PID... has
+      # exited and sets finished to its PID and status to its exit status.
+      # A trapped signal, such as the WINCH of every resize, ends a wait
+      # with no child finished, after which it waits again.
+      await_exit() {
+        while :; do
+          status=0
+          wait -n -p finished "$@" || status=$?
+          if [ -n "''${finished-}" ]; then
+            return
+          fi
+          if [ "$status" -le 128 ]; then
+            echo "claudevm: none of the processes $* is a child of the launcher" >&2
+            exit 1
+          fi
+        done
+      }
+
+      await_exit "$qemu_pid" "$virtiofsd_pid" "$broker_pid"
       if [ "$finished" = "$broker_pid" ]; then
         broker_pid=
         echo "claudevm: broker exited during the session" >&2
@@ -693,8 +715,7 @@ writeShellApplication {
           echo "claudevm: virtiofsd exited during the session" >&2
           exit 1
         fi
-        status=0
-        wait "$qemu_pid" || status=$?
+        await_exit "$qemu_pid"
       fi
       qemu_pid=
       if [ "$status" -ne 0 ]; then

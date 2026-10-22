@@ -64,8 +64,10 @@ as it got. SIGINT, SIGHUP or SIGTERM stops QEMU, virtiofsd and the broker.
   arguments. `claude` works in it with the same API access as the session.
 - The guest boots quietly: kernel and firmware messages stay off the console
   so that the launch output above them remains readable.
-- The terminal size is applied once at launch; resizes do not reach the
-  serial console. Host environment variables other than `TERM` stay out.
+- The session's terminal follows the size of the host terminal window,
+  which reaches the VM over a virtio-serial port that the VM can only
+  read; a resize before the VM has started the session applies when it
+  does. Host environment variables other than `TERM` stay out.
 - The exit status of `claudevm launch` and `claudevm shell` is QEMU's, not
   Claude Code's; 1 if a launch check fails, a `forward_packages` build
   fails, the disks directory is a symlink or cannot be created or set to

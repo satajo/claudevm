@@ -7,13 +7,14 @@ let
   agentGid = config.users.groups.${agent.group}.gid;
 
   # Emits the per-launch QEMU arguments: the VM size from CLAUDEVM_VCPU and
-  # CLAUDEVM_MEM (MiB) and the devices of the shares input. QEMU applies the
-  # last -smp and -m it is given, so these override the baked ones. The
-  # baked memory backend of NUMA node 0 has the fixed size microvm.mem and
-  # the backends of all nodes must add up to -m, so the rest of the
-  # requested RAM forms a second node. microvm.mem is therefore also the
-  # smallest RAM a launch can have. Runs with the runtime directory as
-  # working directory, like virtiofsd-run.
+  # CLAUDEVM_MEM (MiB) and the devices of the shares and terminal inputs.
+  # QEMU applies the last -smp and -m it is given, so these override the
+  # baked ones. The baked memory backend of NUMA node 0 has the fixed size
+  # microvm.mem and the backends of all nodes must add up to -m, so the
+  # rest of the requested RAM forms a second node. microvm.mem is
+  # therefore also the smallest RAM a launch can have. The runner splits
+  # the output at spaces, so no argument may contain one. Runs with the
+  # runtime directory as working directory, like virtiofsd-run.
   launchArgs = pkgs.writeShellApplication {
     name = "claudevm-launch-args";
     text = ''
@@ -32,6 +33,7 @@ let
         )
       fi
       ${inputs.shares.qemuDevices}
+      ${inputs.terminal.qemuDevices}
       echo "''${args[*]}"
     '';
   };

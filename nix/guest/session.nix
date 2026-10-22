@@ -1,7 +1,9 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, utils, ... }:
 
 let
   agent = config.users.users.agent;
+  terminal = config.claudevm.inputs.terminal;
+  winsizePortUnit = "${utils.escapeSystemdPath terminal.portPath}.device";
 
   claudeSession = pkgs.writeShellApplication {
     name = "claude-session";
@@ -21,6 +23,16 @@ in
   # The session owns the serial console instead of a login prompt.
   systemd.services."serial-getty@ttyS0".enable = false;
 
+  # The session reads the size of the console from the port of the
+  # terminal input. systemd's default rules link the port at its path
+  # under /dev/virtio-ports and give its node to root with mode 0600; this
+  # rule gives it to agent with mode 0400, so that agent can read it and
+  # nobody but root can write to it.
+  boot.kernelModules = [ "virtio_console" ];
+  services.udev.extraRules = ''
+    SUBSYSTEM=="virtio-ports", KERNEL=="vport*", ATTR{name}=="${terminal.portName}", OWNER="${agent.name}", MODE="0400"
+  '';
+
   # A failed mount starts emergency mode, in the initrd and in stage 2
   # alike, which with the locked root account would leave the VM running
   # with no session. The initrd has no logind, which systemctl poweroff
@@ -38,8 +50,12 @@ in
   systemd.services.claude-session = {
     description = "Claude Code session on the VM console";
     requires = [ "claudevm-home.service" ];
-    wants = [ "network-online.target" ];
-    after = [ "claudevm-home.service" "network-online.target" ];
+    # The device unit of the port becomes active once udev has linked the
+    # port and set its owner and mode. A port that never appears delays
+    # the session by the device timeout, after which the session reports
+    # it and ends.
+    wants = [ "network-online.target" winsizePortUnit ];
+    after = [ "claudevm-home.service" "network-online.target" winsizePortUnit ];
     unitConfig = {
       RequiresMountsFor = [ "/mnt/launch" ];
       # The end of the session is the end of the VM. Once the unit is
