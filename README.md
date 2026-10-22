@@ -14,20 +14,25 @@ outside the shared directories is gone.
 ## Usage
 
 ```
-nix run /path/to/claudevm -- login                  # store your token, once
+nix run /path/to/claudevm -- login                         # store your token, once
 cd ~/projects/some-repo
-nix run /path/to/claudevm -- init                   # write ./claudevm.toml
-nix run /path/to/claudevm                           # start Claude Code
-nix run /path/to/claudevm -- "summarize this repo"  # arguments go to claude
+nix run /path/to/claudevm -- init                          # write ./claudevm.toml
+nix run /path/to/claudevm -- launch                        # start Claude Code
+nix run /path/to/claudevm -- launch "summarize this repo"  # arguments go to claude
 ```
 
 To install `claudevm`, use `nix profile install /path/to/claudevm`, or add
 the flake as an input and its `packages.x86_64-linux.default` to your
-packages. The commands are then `claudevm`, `claudevm init`,
-`claudevm login` and `claudevm shell`.
+packages. The commands are then `claudevm launch`, `claudevm shell`,
+`claudevm init`, `claudevm login` and `claudevm help`, which prints the
+help, a line for each command, to stdout.
 
-`claudevm` takes what `claude` takes: every argument other than the `init`,
-`login` and `shell` subcommands goes to the Claude Code running in the VM.
+`claudevm launch` takes what `claude` takes: every argument after `launch`
+goes as given to the Claude Code running in the VM, also one that is the
+name of a claudevm command, such as `claudevm launch help`. The other
+commands take no arguments. Without a command, with an unknown one or with
+arguments to a command that takes none, `claudevm` prints the problem and
+the help to stderr, does nothing else and exits with status 1.
 
 Boot waits for the guest network and takes about ten seconds. When Claude
 Code exits, the VM powers off and `claudevm` cleans up; a guest mount that
@@ -47,20 +52,20 @@ as it got. SIGINT, SIGHUP or SIGTERM stops QEMU, virtiofsd and the broker.
   so that the launch output above them remains readable.
 - The terminal size is applied once at launch; resizes do not reach the
   serial console. Host environment variables other than `TERM` stay out.
-- The exit status is QEMU's, not Claude Code's; 1 if a launch check fails, a
-  `forward_packages` build fails, the disks directory is a symlink or cannot
-  be created or set to mode 0700, the VM's disk image cannot be created,
-  opened, unnamed or sized, or virtiofsd or the broker dies mid-session; 2
-  on a usage error; 129/130/143 on SIGHUP/SIGINT/SIGTERM, also when more
-  signals follow during the cleanup.
+- The exit status of `claudevm launch` and `claudevm shell` is QEMU's, not
+  Claude Code's; 1 if a launch check fails, a `forward_packages` build
+  fails, the disks directory is a symlink or cannot be created or set to
+  mode 0700, the VM's disk image cannot be created, opened, unnamed or
+  sized, or virtiofsd or the broker dies mid-session; 129/130/143 on
+  SIGHUP/SIGINT/SIGTERM, also when more signals follow during the cleanup.
 
 ### Token
 
 Every launch requires a token in the claudevm directory, `~/claudevm/token`,
 and refuses to start without one. The environment variable `CLAUDEVM_HOME`
 puts the claudevm directory elsewhere; it must be an absolute path, and
-`claudevm` refuses to run with a relative or empty one. `claudevm login`
-stores the token:
+`claudevm launch`, `claudevm shell` and `claudevm login` refuse to run with
+a relative or empty one. `claudevm login` stores the token:
 
 - On a terminal it runs `claude setup-token` on the host, which signs you in
   through the browser and prints a long-lived OAuth token, and then asks you
@@ -219,7 +224,7 @@ token               brokered    the guest holds a per-session dummy key
 TERM, window size   copied      applied once at launch
 ulimit -Hn          derived     bounds the files the guest holds open on a
                                 share
-claudevm arguments  passed      to claude, or the debug shell instead
+launch arguments    passed      to claude, as given
 /nix/store          ro   --->   /nix/store            not listable; rw overlay
                                                       on the VM's disk
 ~/claudevm/disks    created     the VM's disk         /tmp, /var/tmp, /home, the

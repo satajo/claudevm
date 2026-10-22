@@ -1,8 +1,8 @@
-# What the session runs: Claude Code with the arguments claudevm was given,
-# or the debug shell.
+# What the session runs: Claude Code with the arguments of claudevm launch,
+# or the debug shell of claudevm shell.
 #
-# Uses from the launcher: session and the positional parameters. Uses from
-# plugins: plugin_args.
+# Uses from the launcher: session and the positional parameters, which are
+# the arguments of claude. Uses from plugins: plugin_args.
 { config, lib, pkgs }:
 
 let
