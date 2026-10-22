@@ -1,7 +1,7 @@
 # The host descriptors that each share daemon lets the guest hold, derived
 # from the host's hard limit of open files.
 #
-# Uses from the launcher: host_vcpu.
+# Uses from the launcher: host_vcpu and quoted.
 # Defines for the launcher: share_nofile, the descriptor limit of each
 # virtiofsd and the soft limit of QEMU, and share_threads, the thread pool
 # size of each virtiofsd.
@@ -30,7 +30,7 @@
   collect = ''
     share_nofile=$(ulimit -Hn)
     if ! [[ $share_nofile =~ ^[1-9][0-9]*$ ]]; then
-      echo "claudevm: the hard limit of open files is '$share_nofile', not a number" >&2
+      echo "claudevm: the hard limit of open files is $(quoted "$share_nofile"), not a number" >&2
       exit 1
     fi
     if [ "$share_nofile" -lt 65536 ]; then

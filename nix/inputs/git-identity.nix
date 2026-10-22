@@ -1,5 +1,7 @@
 # The identity that git on the host gives a commit made in the workspace,
 # which becomes the agent's global git config.
+#
+# Uses from the launcher: quoted.
 { config, lib, pkgs }:
 
 let
@@ -33,7 +35,7 @@ in
 
   summary = ''
     for i in "''${!git_identity_keys[@]}"; do
-      printf 'claudevm: %-9s  %s  (git config)\n' "''${git_identity_keys[i]}" "''${git_identity_values[i]}"
+      printf 'claudevm: %-9s  %s  (git config)\n' "''${git_identity_keys[i]}" "$(quoted "''${git_identity_values[i]}")"
     done
   '';
 

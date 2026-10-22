@@ -3,9 +3,9 @@
 # add_share. Each is served by a virtiofsd of its own.
 #
 # Uses from the launcher: workspace, HOME, claudevm_home, token_file,
-# mount_fields, contains, overlaps, refuse and resolve_entry_dir. Uses
-# from transcripts, in add_share: session_dir, which the launcher sets
-# empty and transcripts sets before it calls add_share.
+# mount_fields, contains, overlaps, refuse, resolve_entry_dir and quoted.
+# Uses from transcripts, in add_share: session_dir, which the launcher
+# sets empty and transcripts sets before it calls add_share.
 # Defines for later collect fragments: add_share and in_shared_dir.
 # Defines for the launcher after write: share_sockets.
 #
@@ -104,16 +104,16 @@ in
       local path=$1 mode=$2 subject=$3 name=$4 protected_path guest_path i
       for protected_path in "''${protected[@]}"; do
         if contains "$path" "$protected_path"; then
-          refuse "$subject" "it contains $protected_path"
+          refuse "$subject" "it contains $(quoted "$protected_path")"
         fi
       done
       if [ -n "$claude_dir" ] && contains "$claude_dir" "$path"; then
-        refuse "$subject" "it lies inside $claude_dir"
+        refuse "$subject" "it lies inside $(quoted "$claude_dir")"
       fi
       # The session directory of this launch is the one directory inside
       # the claudevm directory that the VM may see.
       if contains "$claudevm_home" "$path" && [ "$path" != "$session_dir" ]; then
-        refuse "$subject" "it lies inside $claudevm_home"
+        refuse "$subject" "it lies inside $(quoted "$claudevm_home")"
       fi
       for guest_path in ${lib.escapeShellArgs guestPaths}; do
         if overlaps "$guest_path" "$path"; then
@@ -140,7 +140,7 @@ in
       share_names+=("$name")
     }
 
-    add_share "$workspace" rw "$workspace as workspace" "the workspace $workspace"
+    add_share "$workspace" rw "$(quoted "$workspace") as workspace" "the workspace $(quoted "$workspace")"
 
     mount_paths=()
     mount_modes=()
@@ -148,7 +148,7 @@ in
       entry="[[mounts]] entry $((i / 2 + 1))"
       mode=''${mount_fields[i + 1]}
       resolve_entry_dir "$entry" "''${mount_fields[i]}"
-      add_share "$entry_dir" "$mode" "$entry_dir ($entry)" "$entry_dir of $entry"
+      add_share "$entry_dir" "$mode" "$(quoted "$entry_dir") ($entry)" "$(quoted "$entry_dir") of $entry"
       mount_paths+=("$entry_dir")
       mount_modes+=("$mode")
     done
@@ -168,9 +168,9 @@ in
   '';
 
   summary = ''
-    printf 'claudevm: %-9s  rw  %s\n' workspace "$workspace"
+    printf 'claudevm: %-9s  rw  %s\n' workspace "$(quoted "$workspace")"
     for i in "''${!mount_paths[@]}"; do
-      printf 'claudevm: %-9s  %s  %s  (claudevm.toml)\n' mount "''${mount_modes[i]}" "''${mount_paths[i]}"
+      printf 'claudevm: %-9s  %s  %s  (claudevm.toml)\n' mount "''${mount_modes[i]}" "$(quoted "''${mount_paths[i]}")"
     done
   '';
 

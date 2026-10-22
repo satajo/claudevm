@@ -3,8 +3,8 @@
 # read-write through a share, as the agent's ~/.claude/projects, where
 # Claude Code writes the transcripts of the session.
 #
-# Uses from the launcher: workspace and claudevm_home. Uses from shares:
-# add_share.
+# Uses from the launcher: workspace, claudevm_home, quoted and shown. Uses
+# from shares: add_share.
 # Defines for add_share of shares and for the launcher's cleanup:
 # session_dir, which the launcher sets empty and this sets before it calls
 # add_share.
@@ -25,7 +25,7 @@ in
   collect = ''
     sessions_dir=$claudevm_home/sessions
     if [ -L "$sessions_dir" ]; then
-      echo "claudevm: $sessions_dir is a symlink; the sessions directory must be a directory" >&2
+      echo "claudevm: $(quoted "$sessions_dir") is a symlink; the sessions directory must be a directory" >&2
       exit 1
     fi
     mkdir -p "$sessions_dir"
@@ -39,18 +39,18 @@ in
     session_number=1
     until mkdir_error=$(mkdir -m 0700 "$session_path" 2>&1); do
       if [ ! -e "$session_path" ] && [ ! -L "$session_path" ]; then
-        echo "claudevm: $mkdir_error" >&2
+        echo "claudevm: $(shown "$mkdir_error")" >&2
         exit 1
       fi
       session_number=$((session_number + 1))
       session_path=$sessions_dir/$session_name-$session_number
     done
     session_dir=$session_path
-    add_share "$session_dir" rw "$session_dir as session directory" "the session directory $session_dir"
+    add_share "$session_dir" rw "$(quoted "$session_dir") as session directory" "the session directory $(quoted "$session_dir")"
   '';
 
   summary = ''
-    printf 'claudevm: %-9s  rw  %s\n' session "$session_dir"
+    printf 'claudevm: %-9s  rw  %s\n' session "$(quoted "$session_dir")"
   '';
 
   # The entry holds the path of the session directory, at which the guest

@@ -1,4 +1,4 @@
-{ lib, writeShellApplication, coreutils, findutils, git, jq, toml2json, guest, broker }:
+{ lib, writeShellApplication, writeText, coreutils, findutils, git, jq, toml2json, guest, broker }:
 
 let
   runner = guest.microvm.declaredRunner;
@@ -9,7 +9,7 @@ let
   diskFds = guest.claudevm.diskFds;
   phase = name: lib.concatMapStrings (input: input.${name}) inputs;
 
-  configTemplate = ''
+  configTemplate = writeText "claudevm.toml" ''
     # claudevm reads this file once at launch.
     vcpu = ${toString guest.claudevm.vcpu}
     memory = ${toString guest.claudevm.memory}  # MiB
@@ -24,14 +24,18 @@ let
     # writable = false
   '';
 
-  # Checks the JSON form of claudevm.toml. On errors it prints them and
-  # exits 1; otherwise it emits NUL-terminated vcpu, memory, disk, the
-  # number of mounts, a path and mode (ro or rw) pair per mount, the number
-  # of forward_packages entries, those entries and then the plugin_mounts
+  # Checks the JSON form of claudevm.toml and emits NUL-terminated fields:
+  # invalid and the errors, or valid, vcpu, memory, disk, the number of
+  # mounts, a path and mode (ro or rw) pair per mount, the number of
+  # forward_packages entries, those entries and then the plugin_mounts
   # entries.
-  parseConfig = ''
+  parseConfig = writeText "parse-config.jq" ''
     def is_positive_integer: type == "number" and (tojson | test("^[1-9][0-9]*$"));
-    def unknown_keys($known): keys_unsorted[] | select(IN($known[]) | not);
+    # --raw-output0 cannot emit NUL, so an error names no key that holds
+    # one.
+    def unknown_key_errors($known):
+      keys_unsorted[] | select(IN($known[]) | not)
+      | if explode | any(. == 0) then "unknown key that contains NUL" else "unknown key '\(.)'" end;
     def string_array_errors($key):
       select(has($key)) | .[$key]
       | if type != "array" then "'\($key)' must be an array of strings"
@@ -42,8 +46,7 @@ let
             else empty end
         end;
     def errors:
-      (unknown_keys(["vcpu", "memory", "disk", "forward_packages", "plugin_mounts", "mounts", "graphics", "resolution"])
-        | "unknown key '\(.)'"),
+      unknown_key_errors(["vcpu", "memory", "disk", "forward_packages", "plugin_mounts", "mounts", "graphics", "resolution"]),
       (("graphics", "resolution") as $key | select(has($key)) | "'\($key)' is not implemented yet"),
       (("vcpu", "memory", "disk") as $key
         | select(has($key) and (.[$key] | is_positive_integer | not))
@@ -57,7 +60,7 @@ let
           else to_entries[] | "[[mounts]] entry \(.key + 1)" as $entry | .value
             | if type != "object" then "\($entry) must be a table"
               else
-                (unknown_keys(["path", "writable"]) | "\($entry): unknown key '\(.)'"),
+                (unknown_key_errors(["path", "writable"]) | "\($entry): \(.)"),
                 (if has("path") | not then "\($entry): 'path' is missing"
                  elif .path | type != "string" then "\($entry): 'path' must be a string"
                  elif .path | explode | any(. == 0) then "\($entry): 'path' must not contain NUL"
@@ -68,8 +71,9 @@ let
           end);
     [errors] as $errors
     | if $errors != [] then
-        $errors | map("claudevm: claudevm.toml: \(.)\n") | add | halt_error(1)
+        "invalid", $errors[]
       else
+        "valid",
         (.vcpu // ${toString guest.claudevm.vcpu}),
         (.memory // ${toString guest.claudevm.memory}),
         (.disk // ${toString guest.claudevm.disk}),
@@ -82,8 +86,9 @@ let
   '';
 
   # The commands of claudevm, in the order that the help lists them. A
-  # command runs with the arguments after its name as its positional
-  # parameters; one without arguments refuses any.
+  # command's run is a call of a function of the script, which runs with
+  # the arguments after the command's name as positional parameters; a
+  # command without arguments refuses any.
   commands = [
     {
       name = "launch";
@@ -99,63 +104,12 @@ let
     {
       name = "init";
       description = "write a default claudevm.toml here";
-      run = ''
-        if [ -e claudevm.toml ] || [ -L claudevm.toml ]; then
-          echo "claudevm: claudevm.toml already exists" >&2
-          exit 1
-        fi
-        printf '%s' ${lib.escapeShellArg configTemplate} > claudevm.toml
-        echo "claudevm: created claudevm.toml" >&2
-      '';
+      run = "write_default_config";
     }
     {
       name = "login";
       description = "store the Claude token the VM sessions use";
-      run = ''
-        find_claudevm_home
-        # On a terminal, claude setup-token signs in through the browser and
-        # prints a token for pasting. Otherwise stdin carries the token.
-        token=
-        if [ -t 0 ]; then
-          if ! ${claude} setup-token; then
-            echo "claudevm: claude setup-token failed" >&2
-            exit 1
-          fi
-          printf 'Paste the token: ' >&2
-          read -rs token || true
-          echo >&2
-        else
-          read -r token || true
-        fi
-        if [ -z "$token" ]; then
-          echo "claudevm: no token given" >&2
-          exit 1
-        fi
-        # The C locale makes the range below the bytes of printable ASCII.
-        LC_ALL=C
-        if ! [[ $token =~ ^[!-~]+$ ]]; then
-          echo "claudevm: the token must consist of printable ASCII characters without whitespace, as the one claude setup-token prints does" >&2
-          exit 1
-        fi
-        # The broker sends the token as an OAuth bearer token. OAuth tokens,
-        # among them the long-lived ones of claude setup-token, start with
-        # sk-ant-oat; API keys start with sk-ant-api and fail there.
-        case $token in
-          sk-ant-oat*) ;;
-          *)
-            echo "claudevm: the token must start with sk-ant-oat, as the one claude setup-token prints does; API keys (sk-ant-api...) do not work" >&2
-            exit 1
-            ;;
-        esac
-        umask 077
-        mkdir -p "$claudevm_home"
-        chmod 0700 "$claudevm_home"
-        token_tmp=$(mktemp "$claudevm_home/token.XXXXXXXX")
-        trap 'rm -f "$token_tmp"' EXIT
-        printf '%s\n' "$token" > "$token_tmp"
-        mv -fT "$token_tmp" "$token_file"
-        echo "claudevm: token stored in $token_file" >&2
-      '';
+      run = "store_token";
     }
     {
       name = "help";
@@ -168,23 +122,35 @@ let
     command.name + lib.optionalString (command ? arguments) " ${command.arguments}";
   synopsisWidth = lib.foldl' lib.max 0 (map (command: lib.stringLength (synopsis command)) commands);
 
+  # Nix indents only the first line of a multi-line splice. splice COLUMNS
+  # TEXT indents every other non-empty line of TEXT by COLUMNS spaces and
+  # drops its final newline, so that TEXT spliced alone on a line COLUMNS
+  # deep keeps its own indentation. TEXT holds no multi-line string or
+  # heredoc, whose content the indentation would change.
+  splice = columns: text:
+    lib.concatStringsSep "\n" (lib.imap0
+      (i: line: if i == 0 || line == "" then line else lib.strings.replicate columns " " + line)
+      (lib.splitString "\n" (lib.removeSuffix "\n" text)));
+
+  dispatchArm = command: ''
+    ${command.name})
+      shift
+      ${splice 2 (lib.optionalString (!(command ? arguments)) ''
+        if [ "$#" -ne 0 ]; then
+          usage_error "${command.name} takes no arguments"
+        fi
+      '' + command.run)}
+      ;;
+  '';
+
   # Runs the command that the first argument names.
   dispatch = ''
     if [ "$#" -eq 0 ]; then
       usage_error "no command given"
     fi
     case $1 in
-  '' + lib.concatMapStrings (command: ''
-      ${command.name})
-        shift
-        ${lib.optionalString (!(command ? arguments)) ''
-          if [ "$#" -ne 0 ]; then
-            usage_error "${command.name} takes no arguments"
-          fi
-        ''}${command.run}
-        ;;
-  '') commands + ''
-      *) usage_error "unknown command '$1'" ;;
+      ${splice 2 (lib.concatMapStrings dispatchArm commands)}
+      *) usage_error "unknown command $(quoted "$1")" ;;
     esac
   '';
 in
@@ -192,8 +158,57 @@ writeShellApplication {
   name = "claudevm";
   runtimeInputs = [ coreutils findutils git jq toml2json ];
   text = ''
+    # shown TEXT prints TEXT as messages show text from outside claudevm:
+    # with each backslash doubled and each character that is not printable
+    # in the locale, or byte that forms no character, as the escape of its
+    # code, \xHH, \uHHHH or \UHHHHHHHH, so that the text cannot control the
+    # terminal.
+    shown() {
+      local text=$1 plain char code rendered=
+      while [ -n "$text" ]; do
+        # Each round passes on the text up to the next character to escape
+        # at once, which keeps long printable text fast.
+        plain=''${text%%[![:print:]]*}
+        plain=''${plain%%\\*}
+        rendered+=$plain
+        text=''${text:''${#plain}}
+        if [ -z "$text" ]; then
+          break
+        fi
+        char=''${text:0:1}
+        text=''${text:1}
+        case $char in
+          \\) rendered+="\\\\" ;;
+          *)
+            printf -v code '%d' "'$char"
+            if [ "$code" -lt 256 ]; then
+              printf -v char '\\x%02x' "$code"
+            elif [ "$code" -lt 65536 ]; then
+              printf -v char '\\u%04x' "$code"
+            else
+              printf -v char '\\U%08x' "$code"
+            fi
+            rendered+=$char
+            ;;
+        esac
+      done
+      printf '%s' "$rendered"
+    }
+
+    # quoted VALUE... prints each VALUE as messages show a value from
+    # outside claudevm, in single quotes and as shown prints it, separated
+    # by spaces.
+    quoted() {
+      local value separator=
+      for value in "$@"; do
+        printf '%s' "$separator"
+        shown "'$value'"
+        separator=' '
+      done
+    }
+
     print_help() {
-      printf '%s\n' "usage: claudevm COMMAND" "" "commands:"
+      printf '%s\n' "usage: claudevm COMMAND [ARGS...]" "" "commands:"
       printf '  %-${toString synopsisWidth}s  %s\n' ${lib.escapeShellArgs (lib.concatMap (command: [ (synopsis command) command.description ]) commands)}
     }
 
@@ -212,7 +227,7 @@ writeShellApplication {
         case $CLAUDEVM_HOME in
           /*) ;;
           *)
-            echo "claudevm: CLAUDEVM_HOME is '$CLAUDEVM_HOME', which is not an absolute path" >&2
+            echo "claudevm: CLAUDEVM_HOME is $(quoted "$CLAUDEVM_HOME"), which is not an absolute path" >&2
             exit 1
             ;;
         esac
@@ -223,8 +238,62 @@ writeShellApplication {
       # The long-lived OAuth token of the user. Only the broker on the host
       # reads it; the VM never sees it.
       token_file=$claudevm_home/token
-      # Where each launch creates the disk image of its VM.
-      disks_dir=$claudevm_home/disks
+    }
+
+    # Writes claudevm.toml with the defaults into the working directory.
+    write_default_config() {
+      if [ -e claudevm.toml ] || [ -L claudevm.toml ]; then
+        echo "claudevm: claudevm.toml already exists" >&2
+        exit 1
+      fi
+      cat ${configTemplate} > claudevm.toml
+      echo "claudevm: created claudevm.toml" >&2
+    }
+
+    # Stores the token that the user gives in the token file.
+    store_token() {
+      find_claudevm_home
+      # On a terminal, claude setup-token signs in through the browser and
+      # prints a token for pasting. Otherwise stdin carries the token.
+      token=
+      if [ -t 0 ]; then
+        if ! ${claude} setup-token; then
+          echo "claudevm: claude setup-token failed" >&2
+          exit 1
+        fi
+        printf 'Paste the token: ' >&2
+        read -rs token || true
+        echo >&2
+      else
+        read -r token || true
+      fi
+      if [ -z "$token" ]; then
+        echo "claudevm: no token given" >&2
+        exit 1
+      fi
+      # The C locale makes the range below the bytes of printable ASCII.
+      if ! (LC_ALL=C; [[ $token =~ ^[!-~]+$ ]]); then
+        echo "claudevm: the token must consist of printable ASCII characters without whitespace, as the one claude setup-token prints does" >&2
+        exit 1
+      fi
+      # The broker sends the token as an OAuth bearer token. OAuth tokens,
+      # among them the long-lived ones of claude setup-token, start with
+      # sk-ant-oat; API keys start with sk-ant-api and fail there.
+      case $token in
+        sk-ant-oat*) ;;
+        *)
+          echo "claudevm: the token must start with sk-ant-oat, as the one claude setup-token prints does; API keys (sk-ant-api...) do not work" >&2
+          exit 1
+          ;;
+      esac
+      umask 077
+      mkdir -p "$claudevm_home"
+      chmod 0700 "$claudevm_home"
+      token_tmp=$(mktemp "$claudevm_home/token.XXXXXXXX")
+      trap 'rm -f "$token_tmp"' EXIT
+      printf '%s\n' "$token" > "$token_tmp"
+      mv -fT "$token_tmp" "$token_file"
+      echo "claudevm: token stored in $(quoted "$token_file")" >&2
     }
 
     # Succeeds when canonical path $2 equals canonical path $1 or lies
@@ -287,27 +356,29 @@ writeShellApplication {
       session=$1
       shift
       find_claudevm_home
+      # Where each launch creates the disk image of its VM.
+      disks_dir=$claudevm_home/disks
 
       if [ ! -e claudevm.toml ]; then
-        echo "claudevm: no claudevm.toml in $PWD; run 'claudevm init' to create one" >&2
+        echo "claudevm: no claudevm.toml in $(quoted "$PWD"); run 'claudevm init' to create one" >&2
         exit 1
       fi
 
       if [ ! -e "$token_file" ]; then
-        echo "claudevm: no token at $token_file; run 'claudevm login'" >&2
+        echo "claudevm: no token at $(quoted "$token_file"); run 'claudevm login'" >&2
         exit 1
       fi
       if [ ! -f "$token_file" ]; then
-        echo "claudevm: $token_file is not a regular file" >&2
+        echo "claudevm: $(quoted "$token_file") is not a regular file" >&2
         exit 1
       fi
       if [ ! -r "$token_file" ]; then
-        echo "claudevm: cannot read the token at $token_file; run 'claudevm login'" >&2
+        echo "claudevm: cannot read the token at $(quoted "$token_file"); run 'claudevm login'" >&2
         exit 1
       fi
       token_mode=$(stat -L -c %a "$token_file")
       if (( 8#$token_mode & 8#077 )); then
-        echo "claudevm: $token_file has mode $token_mode, which grants group or other access; run chmod 600 $token_file" >&2
+        echo "claudevm: $(quoted "$token_file") has mode $token_mode, which grants group or other access; run chmod 600 $(quoted "$token_file")" >&2
         exit 1
       fi
 
@@ -315,15 +386,15 @@ writeShellApplication {
       # symlink would put the disk images, and what chmod and the sweep of
       # stale images act on, outside it.
       if [ -L "$disks_dir" ]; then
-        echo "claudevm: $disks_dir is a symlink; the disks directory must be a directory" >&2
+        echo "claudevm: $(quoted "$disks_dir") is a symlink; the disks directory must be a directory" >&2
         exit 1
       fi
       if ! mkdir -p "$disks_dir"; then
-        echo "claudevm: cannot create the disks directory $disks_dir" >&2
+        echo "claudevm: cannot create the disks directory $(quoted "$disks_dir")" >&2
         exit 1
       fi
       if ! chmod 0700 "$disks_dir"; then
-        echo "claudevm: cannot set $disks_dir to mode 0700" >&2
+        echo "claudevm: cannot set $(quoted "$disks_dir") to mode 0700" >&2
         exit 1
       fi
 
@@ -332,12 +403,24 @@ writeShellApplication {
       # The digest of claudevm.toml as this launch reads it, which the NOTICE
       # at exit compares against.
       config_before=$(config_fingerprint) || config_before=unreadable
-      if ! config_json=$(toml2json claudevm.toml); then
+      # toml2json writes to stderr only when it fails, and then its error
+      # quotes the file.
+      if ! config_json=$(toml2json claudevm.toml 2>&1); then
+        while IFS= read -r line; do
+          echo "claudevm: toml2json: $(shown "$line")"
+        done <<< "$config_json" >&2
         echo "claudevm: claudevm.toml is not valid TOML" >&2
         exit 1
       fi
-      mapfile -d "" -t config < <(jq --raw-output0 ${lib.escapeShellArg parseConfig} <<< "$config_json")
+      mapfile -d "" -t config < <(jq --raw-output0 --from-file ${parseConfig} <<< "$config_json")
       wait "$!"
+      if [ "''${config[0]}" = invalid ]; then
+        for error in "''${config[@]:1}"; do
+          echo "claudevm: claudevm.toml: $(shown "$error")"
+        done >&2
+        exit 1
+      fi
+      config=("''${config[@]:1}")
 
       vcpu=''${config[0]}
       vcpu_note=
@@ -389,14 +472,14 @@ writeShellApplication {
         case $path in
           \~/*) path=$HOME/''${path#\~/} ;;
           /*) ;;
-          *) config_error "$entry: path '$path' must be absolute or start with ~/" ;;
+          *) config_error "$entry: path $(quoted "$path") must be absolute or start with ~/" ;;
         esac
         if [ ! -e "$path" ]; then
-          refuse "$path ($entry)" "it does not exist"
+          refuse "$(quoted "$path") ($entry)" "it does not exist"
         fi
         entry_dir=$(realpath -e -- "$path")
         if [ ! -d "$entry_dir" ]; then
-          refuse "$entry_dir ($entry)" "it is not a directory"
+          refuse "$(quoted "$entry_dir") ($entry)" "it is not a directory"
         fi
       }
 
@@ -410,7 +493,7 @@ writeShellApplication {
       # cover.
       runtime_parent=$(realpath -e "''${XDG_RUNTIME_DIR:-/tmp}")
       if contains "$claudevm_home" "$runtime_parent"; then
-        refuse "the launch directory under $runtime_parent" "it lies inside $claudevm_home"
+        refuse "the launch directory under $(quoted "$runtime_parent")" "it lies inside $(quoted "$claudevm_home")"
       fi
       runtime=$(mktemp -d "$runtime_parent/claudevm.XXXXXXXX")
       qemu_pid=
@@ -424,7 +507,7 @@ writeShellApplication {
       saved_stty=$(stty -g 2>/dev/null || true)
 
       cleanup() {
-        local status=$? git_after config_after log
+        local status=$? git_after config_after log line
         # Signals that arrive during cleanup, which would end it early, are
         # ignored; the exit status stays that of the first.
         trap "" HUP INT TERM
@@ -452,18 +535,20 @@ writeShellApplication {
         if [ "$status" -ne 0 ]; then
           for log in virtiofsd.log broker.log; do
             if [ -s "$runtime/$log" ]; then
-              cat "$runtime/$log" >&2
+              while IFS= read -r line || [ -n "$line" ]; do
+                echo "claudevm: $log: $(shown "$line")"
+              done < "$runtime/$log" >&2
             fi
           done
         fi
         if [ -n "$git_before" ]; then
           if ! git_after=$(git_fingerprint) || [ "$git_after" != "$git_before" ]; then
-            echo "claudevm: NOTICE: $workspace/.git, its config or its hooks changed during the session." >&2
+            echo "claudevm: NOTICE: $(quoted "$workspace/.git"), its config or its hooks changed during the session." >&2
             echo "claudevm: NOTICE: git runs commands configured there; review them before running git on the host." >&2
           fi
         fi
         if ! config_after=$(config_fingerprint) || [ "$config_after" != "$config_before" ]; then
-          echo "claudevm: NOTICE: $workspace/claudevm.toml changed since this launch read it." >&2
+          echo "claudevm: NOTICE: $(quoted "$workspace/claudevm.toml") changed since this launch read it." >&2
           echo "claudevm: NOTICE: the next launch reads it to decide which host directories the VM shares and which packages the host builds; review it before launching again." >&2
         fi
         rm -rf "$runtime"
@@ -473,10 +558,10 @@ writeShellApplication {
       trap 'exit 130' INT
       trap 'exit 143' TERM
 
-      ${phase "collect"}
+      ${splice 2 (phase "collect")}
 
       if [ -f "$workspace/.git" ]; then
-        echo "claudevm: warning: $workspace/.git is a file whose git directory lies outside the workspace; git will not work inside the VM" >&2
+        echo "claudevm: warning: $(quoted "$workspace/.git") is a file whose git directory lies outside the workspace; git will not work inside the VM" >&2
       fi
 
       # The guest authenticates to the broker with this per-session key, which
@@ -507,15 +592,15 @@ writeShellApplication {
       done
       broker_port=$(< "$runtime/broker.port")
       if ! [[ $broker_port =~ ^[1-9][0-9]{0,4}$ ]] || [ "$broker_port" -gt 65535 ]; then
-        echo "claudevm: broker reported '$broker_port', which is not a port" >&2
+        echo "claudevm: broker reported $(quoted "$broker_port"), which is not a port" >&2
         exit 1
       fi
 
       {
-        ${phase "summary"}
+        ${splice 4 (phase "summary")}
         printf 'claudevm: %-9s  %s%s\n' vcpu "$vcpu" "$vcpu_note"
         printf 'claudevm: %-9s  %s MiB%s\n' memory "$memory" "$memory_note"
-        printf 'claudevm: %-9s  %s MiB  (sparse file in %s)\n' disk "$disk" "$disks_dir"
+        printf 'claudevm: %-9s  %s MiB  (sparse file in %s)\n' disk "$disk" "$(quoted "$disks_dir")"
         echo "claudevm: claude config: image defaults only; token stays on the host; network: IPv4 internet only; LAN, CGNAT, link-local, multicast and host loopback blocked except the broker and DNS"
       } >&2
 
@@ -526,7 +611,7 @@ writeShellApplication {
       # can read it, the guest key included.
       umask 077
       mkdir "$runtime/launch"
-      ${phase "write"}
+      ${splice 2 (phase "write")}
 
       git_before=$(git_fingerprint) || git_before=unreadable
 
@@ -561,21 +646,21 @@ writeShellApplication {
       # calls only.
       find "$disks_dir" -mindepth 1 -maxdepth 1 -type f -name 'disk.*' -empty -mmin +1 -delete
       if ! disk_image=$(mktemp "$disks_dir/disk.XXXXXXXX"); then
-        echo "claudevm: cannot create the VM's disk image in $disks_dir" >&2
+        echo "claudevm: cannot create the VM's disk image in $(quoted "$disks_dir")" >&2
         exit 1
       fi
       # shellcheck disable=SC2094 # QEMU needs the image open read-write and read-only
       if ! exec {disk_rw}<>"$disk_image" {disk_ro}<"$disk_image"; then
-        echo "claudevm: cannot open the VM's disk image $disk_image" >&2
+        echo "claudevm: cannot open the VM's disk image $(quoted "$disk_image")" >&2
         exit 1
       fi
       if ! rm -- "$disk_image"; then
-        echo "claudevm: cannot delete the name of the VM's disk image $disk_image" >&2
+        echo "claudevm: cannot delete the name of the VM's disk image $(quoted "$disk_image")" >&2
         exit 1
       fi
       disk_image=
       if ! truncate -s "''${disk}M" "/proc/self/fd/$disk_rw"; then
-        echo "claudevm: cannot size the VM's disk image to $disk MiB in $disks_dir" >&2
+        echo "claudevm: cannot size the VM's disk image to $disk MiB in $(quoted "$disks_dir")" >&2
         exit 1
       fi
 

@@ -34,6 +34,20 @@ commands take no arguments. Without a command, with an unknown one or with
 arguments to a command that takes none, `claudevm` prints the problem and
 the help to stderr, does nothing else and exits with status 1.
 
+The messages of `claudevm` and of the broker show each path and value that
+comes from outside them, from the command line, the environment,
+`claudevm.toml`, the file system, the git config, a request of the guest
+or a response of the upstream API, in single quotes. `claudevm` relays the
+errors of `toml2json` and, after a failed launch, the logs of virtiofsd
+and the broker line by line, each line prefixed with its source. In all
+of these a backslash appears doubled, and each character that the locale
+does not count as printable, such as an escape character, or byte that
+forms no character appears as the escape of its code, `\xHH`, `\uHHHH` or
+`\UHHHHHHHH`, so that none of this text can control the terminal. The VM's
+console, which carries the session, and the tools that `claudevm` runs
+in the foreground, such as `nix build` for `forward_packages`, `git` and
+`claude setup-token`, write to the terminal as they are.
+
 Boot waits for the guest network and takes about ten seconds. When Claude
 Code exits, the VM powers off and `claudevm` cleans up; a guest mount that
 fails at any stage of the boot, the format and mount of the VM's disk

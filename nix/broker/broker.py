@@ -112,19 +112,29 @@ def log(line: str) -> None:
     sys.stderr.write(line + '\n')
 
 
-def loggable(text: str) -> str:
-    return text if VISIBLE_ASCII.fullmatch(text) else ascii(text)
+def quoted(value: object) -> str:
+    """value as messages show a value from outside the broker. The log
+    reaches the terminal only through the launcher, which escapes its
+    control characters."""
+    return f"'{value}'"
 
 
 def describe(error: BaseException) -> str:
+    """The reason that error gives. An OS error's message comes from the
+    system; the text of any other error can come from the other end, such
+    as the status line of a malformed response, and appears quoted,
+    without the line break that ends a received line."""
     if isinstance(error, OSError) and error.strerror:
         return error.strerror
-    return str(error) or type(error).__name__
+    text = str(error).rstrip('\r\n')
+    if not text:
+        return type(error).__name__
+    return f'{type(error).__name__} {quoted(text)}'
 
 
 def parse_upstream(text: str) -> Upstream:
-    invalid = ValueError(f'the upstream {text!r} is not an http or https '
-                         f'origin such as {DEFAULT_UPSTREAM}')
+    invalid = ValueError(f'the upstream {quoted(text)} is not an http or '
+                         f'https origin such as {DEFAULT_UPSTREAM}')
     try:
         parts = urllib.parse.urlsplit(text)
         explicit_port = parts.port
@@ -160,15 +170,15 @@ def read_guest_key(path: Path) -> GuestKey:
     try:
         return GuestKey(read_secret(path).encode('ascii'))
     except ValueError as error:
-        raise ValueError(f'no guest key at {path} ({error})') from None
+        raise ValueError(f'no guest key at {quoted(path)} ({error})') from None
 
 
 def read_token(path: Path) -> Token:
     try:
         return Token(read_secret(path))
     except ValueError as error:
-        raise ValueError(f'no token at {path} ({error}); {LOGIN_HINT}') \
-            from None
+        raise ValueError(
+            f'no token at {quoted(path)} ({error}); {LOGIN_HINT}') from None
 
 
 def parse_config(argv: list[str]) -> Config:
@@ -259,7 +269,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 response = exchange(connection, request)
             except (OSError, http.client.HTTPException) as error:
-                reason = f'cannot reach {config.upstream.url}: ' \
+                reason = f'cannot reach {quoted(config.upstream.url)}: ' \
                     f'{describe(error)}'
                 log(f'claudevm-broker: {reason}')
                 self.send_error_json(HTTPStatus.BAD_GATEWAY, 'api_error',
@@ -287,7 +297,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise bad_request('the request target must be an absolute path')
         for name, value in self.headers.items():
             if CONTROL_CHARACTER.search(value):
-                raise bad_request(f'malformed value of header {name}')
+                raise bad_request(f'malformed value of header {quoted(name)}')
         body = self.read_body()
 
         headers = [(name, value) for name, value in self.headers.items()
@@ -383,10 +393,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
             self.wfile.flush()
 
+    def send_error(self, code: int, message: str | None = None,
+                   explain: str | None = None) -> None:
+        """Answers a request that http.server refuses as the broker answers
+        its own rejections. The message of http.server shows the request
+        line in Python's repr notation, so the answer gives the status
+        phrase in its place and the log names the request as request_name
+        does."""
+        status = HTTPStatus(code)
+        self.send_error_json(status, 'invalid_request_error',
+                             f'claudevm broker: {status.phrase}')
+
     def request_name(self) -> str:
-        if not self.command:
-            return 'a malformed request'
-        return f'{loggable(self.command)} {loggable(self.path)}'
+        if self.command:
+            return f'{quoted(self.command)} {quoted(self.path)}'
+        # http.server sets the request line before it parses it, and an
+        # empty one for a request line that is too long.
+        if self.requestline:
+            return f'the malformed request {quoted(self.requestline)}'
+        return 'a malformed request'
 
     def log_request(self, code: int | str = '-',
                     size: int | str = '-') -> None:
@@ -419,11 +444,15 @@ def main() -> None:
     config = parse_config(sys.argv[1:])
     try:
         server = Server(config)
+    except OSError as error:
+        sys.exit(f'claudevm-broker: cannot start: {describe(error)}')
+    try:
         write_port_file(config.port_file, server.server_port)
     except OSError as error:
-        sys.exit(f'claudevm-broker: cannot start: {error}')
+        sys.exit(f'claudevm-broker: cannot start: cannot write the port '
+                 f'file {quoted(config.port_file)}: {describe(error)}')
     log(f'claudevm-broker: listening on 127.0.0.1 port {server.server_port}, '
-        f'relaying to {config.upstream.url}')
+        f'relaying to {quoted(config.upstream.url)}')
     server.serve_forever()
 
 

@@ -160,9 +160,9 @@ class Broker:
         self.token_file = directory / 'token'
         self.token_file.write_text(TOKEN + '\n')
         self.port_file = directory / 'broker.port'
-        log_path = directory / 'broker.log'
-        broker_logs.append(log_path)
-        with log_path.open('wb') as log:
+        self.log_path = directory / 'broker.log'
+        broker_logs.append(self.log_path)
+        with self.log_path.open('wb') as log:
             self.process = subprocess.Popen(
                 [BROKER_EXECUTABLE,
                  '--port-file', str(self.port_file),
@@ -352,6 +352,10 @@ class BrokerTest(unittest.TestCase):
                     'request_too_large',
                     'claudevm broker: the request body exceeds '
                     f'{MAX_BODY_SIZE} bytes')),
+            'a request line that http.server refuses': (
+                'GET /a b c HTTP/1.1\r\n\r\n',
+                400, error_body('invalid_request_error',
+                                'claudevm broker: Bad Request')),
             'HTTP/1.0': (
                 f'POST /v1/messages HTTP/1.0\r\n{key}'
                 'content-length: 2\r\n\r\n{}',
@@ -380,7 +384,7 @@ class BrokerTest(unittest.TestCase):
                          'a request without a stored token should get 401')
         self.assertEqual(json.loads(body), error_body(
             'authentication_error',
-            f'claudevm broker: no token at {self.broker.token_file} (No '
+            f"claudevm broker: no token at '{self.broker.token_file}' (No "
             "such file or directory); run 'claudevm login' on the host"),
             'the rejection should tell how to store a token')
         self.assertEqual(len(self.upstream.requests()), before,
@@ -443,8 +447,47 @@ class BrokerTest(unittest.TestCase):
                          'an unreachable upstream should give 502')
         self.assertEqual(json.loads(body), error_body(
             'api_error',
-            f'claudevm broker: cannot reach {url}: Connection refused'),
+            f"claudevm broker: cannot reach '{url}': Connection refused"),
             'the 502 should name the unreachable upstream')
+
+    def test_quotes_the_status_line_of_a_malformed_upstream_response(
+            self) -> None:
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen()
+            url = f'http://127.0.0.1:{listener.getsockname()[1]}'
+
+            def answer() -> None:
+                connection, _ = listener.accept()
+                with connection:
+                    connection.recv(65536)
+                    connection.sendall(b"HTTP/1.1 2\x1b[31mOK it's\r\n\r\n")
+
+            threading.Thread(target=answer, daemon=True).start()
+            broker = Broker(url)
+            try:
+                response, body = broker.request(
+                    'POST', '/v1/messages', b'{}', self.session_headers())
+            finally:
+                broker.stop()
+        self.assertEqual(response.status, 502,
+                         'a malformed upstream response should give 502')
+        reason = (f"cannot reach '{url}': BadStatusLine "
+                  "'HTTP/1.1 2\x1b[31mOK it's'")
+        self.assertEqual(json.loads(body),
+                         error_body('api_error', f'claudevm broker: {reason}'),
+                         'the 502 should quote the status line')
+        self.assertIn(f'claudevm-broker: {reason}\n',
+                      broker.log_path.read_text(),
+                      'the log should quote the status line on one line')
+
+    def test_logs_a_refused_request_line_quoted(self) -> None:
+        self.broker.raw_exchange(b'GET /a b \x1b HTTP/1.1\r\n\r\n')
+        log = self.broker.log_path.read_text()
+        self.assertIn("the malformed request 'GET /a b \x1b HTTP/1.1' -> 400",
+                      log, 'the log should quote the refused request line')
+        self.assertNotIn('Bad request syntax', log,
+                         "the log should not carry http.server's message")
 
     def test_serves_sequential_requests_on_one_keep_alive_connection(
             self) -> None:
@@ -547,10 +590,10 @@ class BrokerTest(unittest.TestCase):
                 'unrecognized arguments: --guest-key'),
             'a missing guest key file': (
                 arguments({'--guest-key-file': str(missing)}), 2,
-                f'no guest key at {missing} (No such file or directory)'),
+                f"no guest key at '{missing}' (No such file or directory)"),
             'an empty guest key file': (
                 arguments({'--guest-key-file': str(empty)}), 2,
-                f'no guest key at {empty} (it is empty)'),
+                f"no guest key at '{empty}' (it is empty)"),
             'an upstream that is not http or https': (
                 arguments({'--upstream': 'ftp://h'}), 2,
                 "the upstream 'ftp://h' is not an http or https origin"),
@@ -559,18 +602,19 @@ class BrokerTest(unittest.TestCase):
                 "the upstream 'http://h/v1' is not an http or https origin"),
             'a missing token file': (
                 arguments({'--token-file': str(missing)}), 2,
-                f'no token at {missing} (No such file or directory); '
+                f"no token at '{missing}' (No such file or directory); "
                 f'{login}'),
             'an empty token file': (
                 arguments({'--token-file': str(empty)}), 2,
-                f'no token at {empty} (it is empty); {login}'),
+                f"no token at '{empty}' (it is empty); {login}"),
             'a token that is not one line of printable ASCII': (
                 arguments({'--token-file': str(two_words)}), 2,
-                f'no token at {two_words} (it is not one line of printable '
+                f"no token at '{two_words}' (it is not one line of printable "
                 f'ASCII); {login}'),
             'a port file in a missing directory': (
                 arguments({'--port-file': str(missing / 'port')}), 1,
-                'claudevm-broker: cannot start: '),
+                'claudevm-broker: cannot start: cannot write the port file '
+                f"'{missing / 'port'}': No such file or directory"),
         }
         for case, (argv, status, message) in cases.items():
             with self.subTest(case):

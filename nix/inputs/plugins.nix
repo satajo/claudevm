@@ -1,7 +1,8 @@
 # The plugin_mounts directories, which the Claude Code of the session loads.
 #
-# Uses from the launcher: plugin_mounts, overlaps, refuse, config_error and
-# resolve_entry_dir. Uses from shares: add_share and in_shared_dir.
+# Uses from the launcher: plugin_mounts, overlaps, refuse, config_error,
+# resolve_entry_dir and quoted. Uses from shares: add_share and
+# in_shared_dir.
 # Defines for the session fragment of command: plugin_args.
 { config, lib, pkgs }:
 
@@ -16,17 +17,17 @@
       entry="plugin_mounts entry $((i + 1))"
       resolve_entry_dir "$entry" "''${plugin_mounts[i]}"
       if [ ! -f "$entry_dir/.claude-plugin/plugin.json" ]; then
-        config_error "$entry: $entry_dir is not a Claude Code plugin: .claude-plugin/plugin.json is missing"
+        config_error "$entry: $(quoted "$entry_dir") is not a Claude Code plugin: .claude-plugin/plugin.json is missing"
       fi
       for j in "''${!plugin_dirs[@]}"; do
         if overlaps "''${plugin_dirs[j]}" "$entry_dir"; then
-          refuse "$entry_dir ($entry)" "it overlaps ''${plugin_dirs[j]} of plugin_mounts entry $((j + 1))"
+          refuse "$(quoted "$entry_dir") ($entry)" "it overlaps $(quoted "''${plugin_dirs[j]}") of plugin_mounts entry $((j + 1))"
         fi
       done
       if in_shared_dir "$entry_dir"; then
         plugin_shares+=(within)
       else
-        add_share "$entry_dir" ro "$entry_dir ($entry)" "$entry_dir of $entry"
+        add_share "$entry_dir" ro "$(quoted "$entry_dir") ($entry)" "$(quoted "$entry_dir") of $entry"
         plugin_shares+=(own)
       fi
       plugin_dirs+=("$entry_dir")
@@ -36,8 +37,8 @@
   summary = ''
     for i in "''${!plugin_dirs[@]}"; do
       case ''${plugin_shares[i]} in
-        own) printf 'claudevm: %-9s  ro  %s  (claudevm.toml)\n' plugin "''${plugin_dirs[i]}" ;;
-        within) printf 'claudevm: %-9s  %s  (claudevm.toml)\n' plugin "''${plugin_dirs[i]}" ;;
+        own) printf 'claudevm: %-9s  ro  %s  (claudevm.toml)\n' plugin "$(quoted "''${plugin_dirs[i]}")" ;;
+        within) printf 'claudevm: %-9s  %s  (claudevm.toml)\n' plugin "$(quoted "''${plugin_dirs[i]}")" ;;
       esac
     done
   '';

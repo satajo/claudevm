@@ -71,10 +71,14 @@ runCommand "claudevm-launcher-test" {
     fi
   }
 
-  # expect_help TEXT fails unless TEXT is the help, which has a line for
-  # every command.
+  # expect_help TEXT fails unless TEXT is the help, which starts with the
+  # usage line and has a line for every command.
   expect_help() {
     local command
+    if [[ $1 != "usage: claudevm COMMAND [ARGS...]"$'\n'* ]]; then
+      printf 'expected the help to start with the usage line, got:\n%s\n' "$1" >&2
+      return 1
+    fi
     for command in launch shell init login help; do
       if [[ $'\n'$1 != *$'\n'"  $command "* ]]; then
         printf 'expected the help with a line for %s, got:\n%s\n' "$command" "$1" >&2
@@ -104,6 +108,15 @@ runCommand "claudevm-launcher-test" {
     fi
     expect_help "''${stderr#*$'\n'}"
     expect_unchanged "$before"
+  }
+
+  # expect_no_control_characters fails if the stderr of the last run of
+  # claudevm holds a control character other than a line break.
+  expect_no_control_characters() {
+    if [[ ''${stderr//$'\n'/} == *[[:cntrl:]]* ]]; then
+      printf 'expected no control characters on stderr, got:\n%s\n' "''${stderr@Q}" >&2
+      return 1
+    fi
   }
 
   # expect_unchanged STATE fails unless the case directory is in STATE.
@@ -171,6 +184,46 @@ runCommand "claudevm-launcher-test" {
       write_config
       expect_usage_error "unknown command '$command'" "$command"
     done
+  }
+
+  control_characters_in_an_unknown_command_are_shown_escaped() {
+    new_case
+    run_claudevm $'\e[31mred\\'
+    expect 1 "claudevm: unknown command '\\x1b[31mred\\\\'"
+    expect_no_control_characters
+  }
+
+  control_characters_in_claudevm_home_are_shown_escaped() {
+    new_case
+    export CLAUDEVM_HOME=$'relative\e[31m'
+    run_claudevm launch
+    expect 1 "claudevm: CLAUDEVM_HOME is 'relative\\x1b[31m', which is not an absolute path"
+    expect_no_control_characters
+  }
+
+  control_characters_in_claudevm_toml_keys_are_shown_escaped() {
+    new_case
+    write_config '"key\u001b[31m" = 1' '[[mounts]]' 'path = "/data"' '"key\u0007" = 2'
+    run_claudevm launch
+    expect 1 "claudevm: claudevm.toml: unknown key 'key\\x1b[31m'"
+    expect 1 "claudevm: claudevm.toml: [[mounts]] entry 1: unknown key 'key\\x07'"
+    expect_no_control_characters
+  }
+
+  control_characters_in_invalid_toml_are_shown_escaped() {
+    new_case
+    write_config $'bad \e[31m'
+    run_claudevm launch
+    expect 1 "bad \\x1b[31m"
+    expect 1 "claudevm: claudevm.toml is not valid TOML"
+    expect_no_control_characters
+  }
+
+  unknown_key_that_contains_nul_is_reported_without_the_key() {
+    new_case
+    write_config '"key\u0000" = 1'
+    run_claudevm launch
+    expect 1 "claudevm: claudevm.toml: unknown key that contains NUL"
   }
 
   arguments_to_a_command_without_arguments_are_refused() {
@@ -245,7 +298,7 @@ runCommand "claudevm-launcher-test" {
     ln -s "$case_dir/elsewhere" "$disks_dir"
     write_config
     launch
-    expect 1 "claudevm: $disks_dir is a symlink; the disks directory must be a directory"
+    expect 1 "claudevm: '$disks_dir' is a symlink; the disks directory must be a directory"
     expect_mode 755 "$case_dir/elsewhere"
   }
 
@@ -254,7 +307,7 @@ runCommand "claudevm-launcher-test" {
     : > "$disks_dir"
     write_config
     launch
-    expect 1 "claudevm: cannot create the disks directory $disks_dir"
+    expect 1 "claudevm: cannot create the disks directory '$disks_dir'"
   }
 
   missing_disks_directory_in_a_read_only_claudevm_directory_is_refused() {
@@ -262,7 +315,7 @@ runCommand "claudevm-launcher-test" {
     chmod 0500 "$CLAUDEVM_HOME"
     write_config
     launch
-    expect 1 "claudevm: cannot create the disks directory $disks_dir"
+    expect 1 "claudevm: cannot create the disks directory '$disks_dir'"
   }
 
   disks_directory_gets_mode_0700() {
@@ -278,6 +331,11 @@ runCommand "claudevm-launcher-test" {
       help_prints_every_command_to_stdout_and_does_nothing_else \
       no_command_prints_the_help_to_stderr_and_fails \
       unknown_command_is_refused \
+      control_characters_in_an_unknown_command_are_shown_escaped \
+      control_characters_in_claudevm_home_are_shown_escaped \
+      control_characters_in_claudevm_toml_keys_are_shown_escaped \
+      control_characters_in_invalid_toml_are_shown_escaped \
+      unknown_key_that_contains_nul_is_reported_without_the_key \
       arguments_to_a_command_without_arguments_are_refused \
       launch_goes_on_to_the_vm_whatever_its_arguments \
       shell_goes_on_to_the_vm \

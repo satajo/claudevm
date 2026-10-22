@@ -1,7 +1,7 @@
 # The forward_packages, built on the host and put on the agent's PATH in the
 # guest, which reads them through its share of the host's store.
 #
-# Uses from the launcher: forward_packages, HOME and config_error.
+# Uses from the launcher: forward_packages, HOME, config_error and quoted.
 #
 # Besides the five fragments it provides login, which puts the packages on
 # PATH in login shells.
@@ -32,22 +32,24 @@ in
         \~/*) installable=$HOME/''${installable#\~/} ;;
       esac
       if ! out_paths=$(nix build --print-out-paths --out-link "$runtime/fwd$((i + 1))" -- "$installable"); then
-        config_error "$entry: building '$installable' failed"
+        config_error "$entry: building $(quoted "$installable") failed"
       fi
+      entry_outputs=()
       bin_dirs=()
       while IFS= read -r out_path; do
         case $out_path in
           /nix/store/*) ;;
-          *) config_error "$entry: '$installable' built $out_path, which lies outside /nix/store, the only store the VM sees" ;;
+          *) config_error "$entry: $(quoted "$installable") built $(quoted "$out_path"), which lies outside /nix/store, the only store the VM sees" ;;
         esac
-        forward_outputs+=("$out_path")
+        entry_outputs+=("$out_path")
         if [ -d "$out_path/bin" ]; then
           bin_dirs+=("$out_path/bin")
         fi
       done <<< "$out_paths"
       if [ "''${#bin_dirs[@]}" -eq 0 ]; then
-        config_error "$entry: '$installable' provides no executables; none of its outputs has a bin directory: ''${out_paths//$'\n'/ }"
+        config_error "$entry: $(quoted "$installable") provides no executables; none of its outputs has a bin directory: $(quoted "''${entry_outputs[@]}")"
       fi
+      forward_outputs+=("''${entry_outputs[@]}")
       forward_installables+=("$installable")
       forward_dirs+=("''${bin_dirs[@]}")
     done
@@ -55,7 +57,7 @@ in
 
   summary = ''
     for installable in "''${forward_installables[@]}"; do
-      printf 'claudevm: %-9s  %s  (claudevm.toml)\n' forward "$installable"
+      printf 'claudevm: %-9s  %s  (claudevm.toml)\n' forward "$(quoted "$installable")"
     done
   '';
 

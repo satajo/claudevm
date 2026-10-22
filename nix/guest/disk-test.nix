@@ -349,7 +349,7 @@ testers.runNixOSTest {
         assert launcher_status(ws) == 1, console(ws)
         output = console(ws)
         assert "No space left on device" in output, output
-        assert f"claudevm: cannot create the VM's disk image in {disks_dir}" in output, output
+        assert f"claudevm: cannot create the VM's disk image in '{disks_dir}'" in output, output
         assert "3008;start=" not in output, "the guest booted"
         assert_no_leftovers()
 

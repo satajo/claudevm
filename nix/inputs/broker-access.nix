@@ -3,7 +3,7 @@
 # which the broker swaps for the token. The guest key is all the guest
 # holds of the API access.
 #
-# Uses from the launcher: broker_port, guest_key and token_file.
+# Uses from the launcher: broker_port, guest_key, token_file and quoted.
 { config, lib, pkgs }:
 
 let
@@ -24,7 +24,7 @@ in
   collect = "";
 
   summary = ''
-    printf 'claudevm: %-9s  127.0.0.1:%s -> api.anthropic.com  (token %s)\n' broker "$broker_port" "$token_file"
+    printf 'claudevm: %-9s  127.0.0.1:%s -> api.anthropic.com  (token %s)\n' broker "$broker_port" "$(quoted "$token_file")"
   '';
 
   write = ''
