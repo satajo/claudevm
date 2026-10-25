@@ -7,10 +7,14 @@ let
   # and nothing from the host adds to. Claude Code asks once per
   # installation to accept bypass permissions mode and records the answer
   # in settings.json; syncClaudeAiPlugins = false keeps the plugins enabled
-  # on the claude.ai account out of the VM.
+  # on the claude.ai account out of the VM. Auto memory is off because no
+  # later session reads what one session remembers: each launch gets a
+  # session directory of its own as ~/.claude/projects, where Claude Code
+  # keeps the memory of a project.
   claudeSettings = pkgs.writeText "claude-settings.json" (builtins.toJSON {
     skipDangerousModePermissionPrompt = true;
     syncClaudeAiPlugins = false;
+    autoMemoryEnabled = false;
   });
   # The ~/.claude.json the image starts from. The setup of the shares input
   # adds the trust of the workspace and that of broker-access the approval

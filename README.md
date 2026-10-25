@@ -188,7 +188,9 @@ writable = false  # default false: read-only
   flake installable, passed as written to `nix build` on the host except
   that a leading `~/` is expanded, so `ripgrep` alone fails where
   `nixpkgs#ripgrep` works. Relative references such as `.#mytool` resolve
-  against the workspace.
+  against the workspace. The image itself has git, python3, jq, file, zip,
+  unzip and make besides the base system's coreutils, grep, sed, awk, find,
+  diff, tar, curl and perl, and Claude Code brings ripgrep.
 - The builds run at launch, before the VM starts, with your nix settings
   and under nix's normal build sandbox. The first build of an entry may
   need network access and take a while; later launches reuse what is already
@@ -271,8 +273,9 @@ everything else     not shared
 - Claude config: Claude Code starts from the image's defaults, which mark
   onboarding as completed, the bypass permissions prompt as accepted and the
   workspace as trusted, select the dark theme, turn off syncing of the
-  plugins enabled on your claude.ai account, and turn off nonessential
-  traffic and auto-updates. Nothing comes from the host's `~/.claude` or
+  plugins enabled on your claude.ai account, turn off auto memory, which no
+  later session would read, and turn off nonessential traffic and
+  auto-updates. Nothing comes from the host's `~/.claude` or
   `~/.claude.json`. Project config comes from the workspace, where Claude
   Code reads `CLAUDE.md`, `.claude/` and `.mcp.json` as it does on the host
   in a trusted folder. The transcripts stay on the host in the session

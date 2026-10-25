@@ -90,9 +90,18 @@ in
       group = "users";
     };
 
+    # The tools the agent reaches for whatever the workspace holds, on top
+    # of the base system's coreutils, grep, sed, awk, find, diff, tar, curl
+    # and perl.
     environment.systemPackages = [
       cfg.claudeCode
+      pkgs.file
       pkgs.git
+      pkgs.gnumake
+      pkgs.jq
+      pkgs.python3
+      pkgs.unzip
+      pkgs.zip
     ];
   };
 }
