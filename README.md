@@ -453,3 +453,8 @@ and `claudevm.disk` in `nix/guest/disk.nix` are the defaults that
 `claudevm init` writes and that apply to a key the file leaves out.
 `claudevm.claudeCode` is the Claude Code of the VM and of `claudevm login`,
 by default the `claude-code` of the nixpkgs in `flake.lock`.
+
+## Development
+
+`make check` builds the packages and runs the tests, which are the
+`checks` of the flake. The VM tests need `/dev/kvm`.
