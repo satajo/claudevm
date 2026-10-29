@@ -274,8 +274,9 @@ everything else     not shared
   onboarding as completed, the bypass permissions prompt as accepted and the
   workspace as trusted, select the dark theme, turn off syncing of the
   plugins enabled on your claude.ai account, turn off auto memory, which no
-  later session would read, and turn off nonessential traffic and
-  auto-updates. Nothing comes from the host's `~/.claude` or
+  later session would read, leave Claude Code's attribution out of commit
+  messages and pull request descriptions, and turn off nonessential traffic
+  and auto-updates. Nothing comes from the host's `~/.claude` or
   `~/.claude.json`. Project config comes from the workspace, where Claude
   Code reads `CLAUDE.md`, `.claude/` and `.mcp.json` as it does on the host
   in a trusted folder. The transcripts stay on the host in the session

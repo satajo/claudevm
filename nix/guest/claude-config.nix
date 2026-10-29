@@ -10,11 +10,17 @@ let
   # on the claude.ai account out of the VM. Auto memory is off because no
   # later session reads what one session remembers: each launch gets a
   # session directory of its own as ~/.claude/projects, where Claude Code
-  # keeps the memory of a project.
+  # keeps the memory of a project. The empty attribution texts keep Claude
+  # Code's trailer out of commit messages and its note out of pull request
+  # descriptions.
   claudeSettings = pkgs.writeText "claude-settings.json" (builtins.toJSON {
     skipDangerousModePermissionPrompt = true;
     syncClaudeAiPlugins = false;
     autoMemoryEnabled = false;
+    attribution = {
+      commit = "";
+      pr = "";
+    };
   });
   # The ~/.claude.json the image starts from. The setup of the shares input
   # adds the trust of the workspace and that of broker-access the approval
