@@ -726,5 +726,9 @@ writeShellApplication {
     ${dispatch}
   '';
 
-  meta.description = "Start an ephemeral microVM that runs Claude Code with bypassed permissions on the current directory";
+  meta = {
+    description = "Start an ephemeral microVM that runs Claude Code with bypassed permissions on the current directory";
+    homepage = "https://github.com/satajo/claudevm";
+    license = lib.licenses.gpl3Plus;
+  };
 }
